@@ -1,0 +1,8 @@
+# Synthetic credentials in the redaction/guard tests (reviewed): not real secrets.
+agent/tests/omni_layout.py:generic-api-key:60
+agent/tests/test_omni_bridge.py:generic-api-key:1235
+agent/tests/test_omni_policy.py:generic-api-key:1099
+agent/tests/test_omni_policy.py:generic-api-key:1100
+agent/tests/test_omni_policy.py:generic-api-key:1101
+agent/tests/test_omni_policy.py:generic-api-key:1104
+agent/tests/test_omni_policy.py:generic-api-key:592

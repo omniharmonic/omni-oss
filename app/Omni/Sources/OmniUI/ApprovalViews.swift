@@ -1,0 +1,720 @@
+import OmniClient
+import OmniCore
+import PrismModels
+import SwiftUI
+
+/// One approval, wherever it appears. Shows exactly what would be sent — every field, the
+/// whole body — and offers Send only when that content matches the server's digest.
+/// Every button here is a person's tap; nothing in the app presses them.
+struct ApprovalCardView: View {
+    let center: ApprovalCenter
+    let id: String
+    /// Said above the draft (a card's "Something new arrived since this draft"). The draft stays decidable.
+    var warning: String? = nil
+    @State private var editing: ApprovalDraft?
+    @State private var revising = false
+    @State private var feedback = ""
+    @State private var confirmingCancel = false
+
+    var body: some View {
+        if let card = center.card(for: id) {
+            content(card)
+        }
+    }
+
+    @ViewBuilder private func content(_ card: ApprovalCard) -> some View {
+        let standing = card.standing()
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label(header(standing, card), systemImage: symbol(standing))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(tint(standing))
+                Spacer()
+                if card.isBusy { ProgressView().controlSize(.small).accessibilityLabel("Working") }
+            }
+            if standing == .pending, let warning {
+                Label(warning, systemImage: "envelope.badge")
+                    .font(.callout.weight(.semibold)).foregroundStyle(Color.warningText)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("approval.\(card.id).warning")
+            }
+            if standing == .revised {
+                // A replaced draft is history: one line is enough.
+                EmptyView()
+            } else {
+                if !card.content.newRecipients.isEmpty {
+                    // Someone the original item did not include: a person must notice before Send.
+                    Label("\(CardText.newRecipient): \(card.content.newRecipients.joined(separator: ", ")) — not on the original thread", systemImage: "person.crop.circle.badge.exclamationmark")
+                        .font(.callout.weight(.semibold)).foregroundStyle(Color.warningText)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("approval.\(card.id).newRecipient")
+                }
+                draft(card.content)
+            }
+            if let line = card.statusLine() {
+                Text(line).font(.callout).foregroundStyle(standing == .mismatch || standing == .unknown ? AnyShapeStyle(Color.warningText) : AnyShapeStyle(Color.quietText))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if standing == .pending, let off = card.sendingSwitchedOff {
+                Label(off, systemImage: "powerplug").font(.caption).foregroundStyle(Color.quietText)
+            }
+            if let notice = card.notice {
+                Label(notice.text, systemImage: noticeSymbol(notice.tone))
+                    .font(.callout)
+                    .foregroundStyle(noticeStyle(notice.tone))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            buttons(card, standing)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.background, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(standing == .pending ? AnyShapeStyle(.tint.opacity(0.5)) : AnyShapeStyle(.separator)))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Approval: \(card.content.headline)")
+        .sheet(item: $editing) { draft in
+            ApprovalEditSheet(draft: draft, kindLabel: card.content.kindLabel) { edited in
+                await center.saveEdit(card.id, draft: edited)
+            }
+        }
+        .sheet(isPresented: $revising) {
+            ReviseSheet(feedback: $feedback) {
+                let text = feedback
+                feedback = ""
+                Task { await center.revise(card.id, feedback: text) }
+            }
+        }
+    }
+
+    /// A device sign-in's matching code, large and first: the owner compares it with the code
+    /// on the sign-in page before he approves. Without a code, a warning instead.
+    @ViewBuilder private func matchCode(_ content: ApprovalContent) -> some View {
+        if let notice = content.matchCodeNotice {
+            VStack(alignment: .leading, spacing: 4) {
+                if let code = content.matchCode {
+                    Text(ApprovalContent.matchCodeCaption).font(.callout).foregroundStyle(Color.quietText)
+                    Text(code)
+                        .font(.system(.largeTitle, design: .monospaced).weight(.semibold))
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("approval.matchCode")
+                    Text(notice).font(.callout).fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Label(notice, systemImage: "exclamationmark.triangle")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(Color.warningText)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("approval.matchCodeMissing")
+                }
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(content.matchCode.map { "\(ApprovalContent.matchCodeCaption): \($0.map { String($0) }.joined(separator: " ")). \(notice)" } ?? notice)
+            Divider()
+        }
+    }
+
+    @ViewBuilder private func draft(_ content: ApprovalContent) -> some View {
+        matchCode(content)
+        if typeSize.isAccessibilitySize {
+            // Each label above its value: beside it, a long address gets a column five characters wide.
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(content.fields) { field in
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(field.label).font(.callout).foregroundStyle(Color.quietText)
+                        Text(field.value).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("\(field.label): \(field.value)")
+                }
+            }
+        } else {
+        Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 4) {
+            ForEach(content.fields) { field in
+                GridRow {
+                    Text(field.label).font(.callout).foregroundStyle(Color.quietText).gridColumnAlignment(.trailing)
+                    Text(field.value).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("\(field.label): \(field.value)")
+            }
+        }
+        }
+        if let body = content.body {
+            Divider()
+            // The whole text, never shortened, and verbatim (not rendered as
+            // markdown): what is approved is exactly what will be sent.
+            Text(body).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                .accessibilityLabel("Text: \(body)")
+        }
+    }
+
+    /// Side by side where the whole row fits; one under another where it does not (large
+    /// text, a narrow column, a long label) — never squeezed onto two lines or cut.
+    @ViewBuilder private func buttons(_ card: ApprovalCard, _ standing: ApprovalCard.Standing) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) { actions(card, standing) }
+                VStack(alignment: .leading, spacing: 8) { actions(card, standing) }
+            }
+            #if os(iOS)
+            .buttonStyle(.bordered)
+            #endif
+            .controlSize(.regular)
+            .fixedSize(horizontal: false, vertical: true)
+            if card.canOfferCancel(), !card.isCommand, !card.isDeviceSignIn {
+                Button { confirmingCancel = true } label: {
+                    Text("Cancel Draft").frame(minHeight: 44).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.quietText)
+                .accessibilityIdentifier("approval.cancel")
+                .accessibilityHint("Discards this draft; nothing is sent")
+                .confirmationDialog("Cancel this draft?", isPresented: $confirmingCancel, titleVisibility: .visible) {
+                    Button("Cancel Draft", role: .destructive) { Task { await center.cancel(card.id) } }
+                    Button("Keep", role: .cancel) {}
+                } message: {
+                    Text("Nothing is sent. Omni can write a new one if you ask.")
+                }
+            }
+        }
+        .disabled(card.isBusy)
+    }
+
+    @ViewBuilder private func actions(_ card: ApprovalCard, _ standing: ApprovalCard.Standing) -> some View {
+        Group {
+            if let retry = card.retry, standing == .pending {
+                Button { Task { await center.retry(card.id) } } label: { actionLabel("Try Again") }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityHint("Repeats the \(retry.rawValue) decision; the server will not act on it twice")
+            } else if CommsDraft(card.approval) != nil, standing == .pending {
+                // A Comms reply draft is approved only in Comms, where every line of it must have been
+                // on screen first (Task 2 review round 3); the server refuses it from here (approve_in_comms).
+                Label("Review in Comms", systemImage: "message")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Color.quietText)
+                    .frame(minHeight: 44)
+                    .accessibilityIdentifier("approval.review-in-comms")
+                    .accessibilityHint("Open Comms to read the whole reply and approve it there")
+            } else if card.canOfferSend() {
+                Button { Task { await center.send(card.id) } } label: { actionLabel(card.isDeviceSignIn || card.isAction ? "Approve" : card.isCommand ? "Approve Once" : "Send") }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("approval.send")
+                    .accessibilityHint(card.isDeviceSignIn ? "Lets the device shown sign in as you, after you confirm on this device" : card.isCommand ? "Lets Omni run exactly what is shown, once, after you confirm on this device" : card.isAction ? "Lets Omni do exactly the steps shown, after you confirm on this device" : "Sends exactly what is shown, after you confirm on this device")
+            }
+            if card.canOfferEdit() {
+                Button { editing = ApprovalDraft(card.approval) } label: { actionLabel("Edit") }
+                    .accessibilityIdentifier("approval.edit")
+                    .accessibilityHint("Change the wording yourself")
+            }
+            if card.canOfferCancel() && card.isDeviceSignIn {
+                Button(role: .destructive) { Task { await center.cancel(card.id) } } label: { actionLabel("Deny") }
+                    .accessibilityIdentifier("approval.deny")
+                    .accessibilityHint("The device is not signed in")
+            } else if card.canOfferCancel() && card.isCommand {
+                Button(role: .destructive) { Task { await center.cancel(card.id) } } label: { actionLabel("Deny") }
+                    .accessibilityHint("Omni does not run it")
+            } else if card.canOfferRevise() {
+                Button { revising = true } label: { actionLabel("Revise…") }
+                    .accessibilityIdentifier("approval.revise")
+                    .accessibilityHint("Ask Omni for a new draft")
+
+            }
+            if standing == .mismatch {
+                Button { Task { await center.reload(card.id) } } label: { actionLabel("Reload") }
+                    .accessibilityHint("Reads the draft from the server again")
+            }
+        }
+        .fixedSize()
+    }
+
+    private func actionLabel(_ title: String) -> some View {
+        Text(title).frame(minHeight: 32) // Native bordered padding brings the tap target to 44 points.
+    }
+
+    @Environment(\.dynamicTypeSize) private var typeSize
+
+    private func header(_ standing: ApprovalCard.Standing, _ card: ApprovalCard) -> String {
+        let kind = card.content.kindLabel
+        if card.isDeviceSignIn {
+            switch standing {
+            case .pending: return "SIGN IN A NEW DEVICE · APPROVE?"
+            case .sending: return "SIGN IN A NEW DEVICE · APPROVING"
+            case .sent: return "SIGN IN A NEW DEVICE · APPROVED"
+            case .cancelled, .revised: return "SIGN IN A NEW DEVICE · DENIED"
+            case .expired: return "SIGN IN A NEW DEVICE · EXPIRED"
+            default: break
+            }
+        }
+        if card.isCommand {
+            switch standing {
+            case .pending: return "OMNI IS WAITING · APPROVE?"
+            case .sending: return "APPROVED · RUNNING"
+            case .sent: return "APPROVED · RAN"
+            case .failed: return "APPROVED · RAN AND FAILED"
+            case .unknown: return "APPROVED · NO WORD BACK"
+            case .cancelled, .revised: return "NOT RUN"
+            case .expired: return "NOT RUN · NO ANSWER IN TIME"
+            default: break
+            }
+        }
+        switch standing {
+        case .pending: return "APPROVE · \(kind)".uppercased()
+        case .mismatch: return "CAN'T VERIFY · \(kind)".uppercased()
+        case .sent: return "SENT · \(kind)".uppercased()
+        case .failed: return "NOT SENT · \(kind)".uppercased()
+        case .unknown: return "MAY HAVE BEEN SENT · \(kind)".uppercased()
+        case .cancelled: return "CANCELLED · \(kind)".uppercased()
+        case .expired: return "EXPIRED · \(kind)".uppercased()
+        case .revised: return "REVISED · \(kind)".uppercased()
+        case .sending: return "SENDING · \(kind)".uppercased()
+        case .other(let status): return "\(status) · \(kind)".uppercased()
+        }
+    }
+
+    private func symbol(_ standing: ApprovalCard.Standing) -> String {
+        switch standing {
+        case .pending: return "hand.raised"
+        case .mismatch, .unknown: return "exclamationmark.triangle"
+        case .sent: return "paperplane"
+        case .failed: return "xmark.circle"
+        default: return "tray"
+        }
+    }
+
+    private func tint(_ standing: ApprovalCard.Standing) -> AnyShapeStyle {
+        switch standing {
+        case .pending: return AnyShapeStyle(.tint)
+        case .mismatch, .unknown: return AnyShapeStyle(Color.warningText)
+        default: return AnyShapeStyle(Color.quietText)
+        }
+    }
+
+    private func noticeSymbol(_ tone: ApprovalCard.Tone) -> String {
+        switch tone {
+        case .info: return "info.circle"
+        case .success: return "checkmark.circle"
+        case .warning: return "exclamationmark.triangle"
+        case .failure: return "xmark.octagon"
+        }
+    }
+
+    private func noticeStyle(_ tone: ApprovalCard.Tone) -> AnyShapeStyle {
+        switch tone {
+        case .warning: return AnyShapeStyle(Color.warningText)
+        case .failure: return AnyShapeStyle(Color.failureText)
+        default: return AnyShapeStyle(Color.quietText)
+        }
+    }
+}
+
+struct ApprovalEditSheet: View {
+    @State var draft: ApprovalDraft
+    let kindLabel: String
+    let save: (ApprovalDraft) async -> Bool
+    @State private var saving = false
+    @Environment(\.dismiss) private var dismiss
+    /// The body's box grows with the text size.
+    @ScaledMetric private var editorHeight: CGFloat = 160
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                ForEach($draft.fields) { $field in
+                    Section(field.label) {
+                        if field.multiline {
+                            TextEditor(text: $field.text).frame(minHeight: editorHeight).accessibilityLabel(field.label)
+                        } else {
+                            // The section already names it: no second label beside the field.
+                            TextField(field.label, text: $field.text).labelsHidden().accessibilityLabel(field.label)
+                        }
+                    }
+                }
+                Section {
+                    Text("Saving makes a new draft to review. Recipients and times can't be changed here — ask Omni to revise instead.")
+                        .font(.footnote)
+                        .foregroundStyle(Color.quietText)
+                }
+            }
+            .formStyle(.grouped)
+            .navigationTitle("Edit \(kindLabel)")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        saving = true
+                        Task {
+                            let saved = await save(draft)
+                            saving = false
+                            // A failure is explained on the card underneath.
+                            _ = saved
+                            dismiss()
+                        }
+                    }
+                    .disabled(saving || !draft.hasChanges)
+                }
+            }
+        }
+        .frame(minWidth: 420, minHeight: 380)
+    }
+}
+
+struct ReviseSheet: View {
+    @Binding var feedback: String
+    let submit: () -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("What should change?") {
+                    // The example is a prompt inside the field, not a label beside it.
+                    TextField("What should change", text: $feedback, prompt: Text("Make it shorter, mention Friday…"), axis: .vertical)
+                        .labelsHidden()
+                        .lineLimit(3...8)
+                        .accessibilityLabel("What should change")
+                }
+                Section {
+                    Text("This draft is set aside and Omni writes a new one for you to review. Nothing is sent.")
+                        .font(.footnote)
+                        .foregroundStyle(Color.quietText)
+                }
+            }
+            .formStyle(.grouped)
+            .navigationTitle("Revise")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Ask Omni") {
+                        submit()
+                        dismiss()
+                    }
+                    .disabled(feedback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+        .frame(minWidth: 380, minHeight: 240)
+    }
+}
+
+enum NeedsYouText {
+    static func clear(inMotion: Int) -> String {
+        switch inMotion {
+        case 0: return "You're clear."
+        case 1: return "You're clear. 1 thing is in motion."
+        default: return "You're clear. \(inMotion) things are in motion."
+        }
+    }
+}
+
+/// A fixed clock for pictures; nil (the default) means the real time.
+private struct CardsClockKey: EnvironmentKey { static let defaultValue: Date? = nil }
+extension EnvironmentValues {
+    var cardsNow: Date? {
+        get { self[CardsClockKey.self] }
+        set { self[CardsClockKey.self] = newValue }
+    }
+}
+
+extension NeedsYouText {
+    /// The empty state's description: only what is in motion; nothing when nothing is.
+    static func inMotion(_ count: Int) -> String {
+        switch count {
+        case 0: return ""
+        case 1: return "1 thing is in motion."
+        default: return "\(count) things are in motion."
+        }
+    }
+}
+
+struct NeedsYouSectionHeader: View {
+    let title: String
+    let count: Int
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(title).font(.title3.weight(.semibold))
+            Text("\(count)").font(.callout).foregroundStyle(Color.quietText)
+            Spacer()
+        }
+        .frame(minHeight: CardMetrics.minTouch)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
+        .accessibilityIdentifier("needsYou.section.\(title.lowercased().replacingOccurrences(of: " ", with: "-"))")
+    }
+}
+
+/// Needs you: Decide (choose how to handle it), Approve (drafts ready to send) and In motion (Omni
+/// working or waiting). Nothing else at the top level: the proactivity dial, errors of the nudge
+/// sweep and the weekly audit are in Settings -> Attention.
+struct NeedsYouView: View {
+    let session: SessionModel
+    @Environment(\.navigator) private var navigator
+    @Environment(\.cardsNow) private var now
+    @State private var showsMotion = true
+    @State private var focusTask: Task<Void, Never>?
+
+    private struct FocusProbe: Equatable { var id: String?; var shown: Bool; var approvalID: String?; var approvalShown: Bool }
+    private var focusProbe: FocusProbe {
+        let id = session.cards?.focusedCardID
+        let approval = session.approvals.focusedApprovalID
+        return FocusProbe(id: id, shown: id.map { session.cards?.isShown($0) ?? false } ?? false,
+                          approvalID: approval,
+                          approvalShown: approval.map { a in session.approvals.pending.contains { $0.id == a } } ?? false)
+    }
+
+    /// Scroll to the tapped draft, keep it in view for about two seconds, then let go.
+    private func revealApproval(_ id: String, _ proxy: ScrollViewProxy) async {
+        try? await Task.sleep(for: .milliseconds(80))
+        guard !Task.isCancelled else { return }
+        withAnimation { proxy.scrollTo(id, anchor: .top) }
+        try? await Task.sleep(for: .seconds(2))
+        guard !Task.isCancelled else { return }
+        if session.approvals.focusedApprovalID == id { session.approvals.focus(nil) }
+    }
+
+    /// Scroll to the focused card (opening In motion first when it is in there), keep its outline
+    /// for about two seconds, then let go so the same card can be focused again.
+    private func reveal(_ id: String, _ proxy: ScrollViewProxy) async {
+        if session.cards?.inMotion.contains(where: { $0.id == id }) == true { showsMotion = true }
+        try? await Task.sleep(for: .milliseconds(80))
+        guard !Task.isCancelled else { return }
+        withAnimation { proxy.scrollTo(id, anchor: .top) }
+        try? await Task.sleep(for: .seconds(2))
+        guard !Task.isCancelled else { return }
+        if session.cards?.focusedCardID == id { session.cards?.focus(nil) }
+    }
+
+    private func refresh() async {
+        await session.approvals.refresh()
+        await session.cards?.refresh()
+        await session.nudges?.refresh()
+    }
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 16) {
+                    if let failure = session.cards?.phase.failure ?? session.approvals.phase.failure {
+                        Label(failure, systemImage: "wifi.exclamationmark").foregroundStyle(Color.quietText)
+                        Button("Try again") { Task { await refresh() } }.frame(minHeight: CardMetrics.minTouch)
+                    }
+                    if let cards = session.cards { sections(cards) } else { draftsOnly }
+                }
+                .padding()
+                .frame(maxWidth: 820, alignment: .leading)
+                .frame(maxWidth: .infinity)
+            }
+            .onChange(of: focusProbe, initial: true) { _, probe in
+                if let id = probe.approvalID, probe.approvalShown {
+                    focusTask?.cancel()
+                    focusTask = Task { await revealApproval(id, proxy) }
+                    return
+                }
+                guard let id = probe.id, probe.shown else { return }   // not loaded yet: wait for the next cards change
+                focusTask?.cancel()
+                focusTask = Task { await reveal(id, proxy) }
+            }
+        }
+        .navigationTitle("Needs you")
+        .refreshable { await refresh() }
+        #if os(macOS)
+        .toolbar { MacRefreshButton(refreshing: false) { Task { await refresh() } } }
+        #endif
+        .task { await refresh() }
+    }
+
+    @ViewBuilder private func sections(_ cards: CardsModel) -> some View {
+        let decide = cards.decide
+        let approve = cards.approve
+        let motion = cards.inMotion
+        let drafts = session.approvals.pending.filter { !cards.linkedApprovalIDs.contains($0.id) }
+        switch NeedsYouState.of(cards: cards.phase, approvals: session.approvals.phase, isEmpty: decide.isEmpty && approve.isEmpty && drafts.isEmpty) {
+        case .clear:
+            ContentUnavailableView {
+                Label("You're clear", systemImage: "checkmark.circle")
+            } description: {
+                if !motion.isEmpty { Text(NeedsYouText.inMotion(motion.count)) }
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(NeedsYouText.clear(inMotion: motion.count))
+            .accessibilityIdentifier("needsYou.clear")
+        case .loading:
+            Label("Checking what needs you…", systemImage: "arrow.triangle.2.circlepath")
+                .font(.callout).foregroundStyle(Color.quietText)
+                .accessibilityIdentifier("needsYou.loading")
+        case .items: EmptyView()
+        }
+        ForEach(NeedsYouLayout.sections(drafts: drafts.count, decide: decide.count, approve: approve.count, motion: motion.count), id: \.self) { section in
+            switch section {
+            case .drafts:
+                NeedsYouSectionHeader(title: "Drafts", count: drafts.count)
+                ForEach(drafts) { draft in loneDraft(draft).id(draft.id) }
+            case .decide:
+                NeedsYouSectionHeader(title: "Decide", count: decide.count)
+                ForEach(decide) { card in CardView(cards: cards, approvals: session.approvals, id: card.id, now: now).id(card.id) }
+            case .approve:
+                NeedsYouSectionHeader(title: "Approve", count: approve.count)
+                ForEach(approve) { card in CardView(cards: cards, approvals: session.approvals, id: card.id, now: now).id(card.id) }
+            case .motion:
+                DisclosureGroup(isExpanded: $showsMotion) {
+                    ForEach(motion) { CardMotionRow(card: $0).id($0.id) }
+                } label: {
+                    NeedsYouSectionHeader(title: "In motion", count: motion.count)
+                }
+            }
+        }
+    }
+
+    /// Without the card routes (an older server): the drafts, as before.
+    @ViewBuilder private var draftsOnly: some View {
+        let pending = session.approvals.pending
+        if pending.isEmpty, session.approvals.phase == .loading || session.approvals.phase == .idle {
+            Label("Checking what needs you…", systemImage: "arrow.triangle.2.circlepath").font(.callout).foregroundStyle(Color.quietText)
+        } else if pending.isEmpty, session.approvals.phase.failure == nil {
+            ContentUnavailableView("Nothing needs you", systemImage: "checkmark.circle", description: Text("Drafts waiting for your decision appear here. Nothing goes out without your tap."))
+        }
+        ForEach(pending) { loneDraft($0).id($0.id) }
+    }
+
+    private func loneDraft(_ draft: ApprovalCard) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ApprovalCardView(center: session.approvals, id: draft.id)
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.accentColor, lineWidth: session.approvals.focusedApprovalID == draft.id ? 2 : 0))
+            if let threadID = draft.approval.threadId {
+                Button { navigator.open(.thread(threadID)) } label: { Text("Open thread").frame(minHeight: CardMetrics.minTouch).contentShape(Rectangle()) }
+                    .buttonStyle(.borderless).font(.callout)
+            }
+        }
+    }
+}
+
+/// Settings -> Attention: what used to sit at the top of Needs you.
+struct AttentionSettingsView: View {
+    let center: NudgeCenter
+
+    var body: some View {
+        Form {
+            Section("Proactivity") {
+                Picker("Attention level", selection: Binding(get: { center.settings.dial }, set: { dial in
+                    Task { await center.save(NudgeSettings(dial: dial, killed: center.settings.killed)) }
+                })) {
+                    ForEach(ProactivityDial.allCases, id: \.self) { dial in Text(dial.rawValue.capitalized).tag(dial) }
+                }
+                Toggle("Pause nudges", isOn: Binding(get: { center.settings.killed }, set: { killed in
+                    Task { await center.save(NudgeSettings(dial: center.settings.dial, killed: killed)) }
+                }))
+                Text("Off and Pause keep Needs you available. Apple\u{2019}s notification settings and Focus control delivery; Omni does not read your current Focus. Drafts always need your review.")
+                    .font(.caption).foregroundStyle(Color.quietText)
+            }
+            .disabled(center.busy.contains("settings") || center.phase != .loaded)
+            if let failure = center.phase.failure ?? center.failure {
+                Section {
+                    Label(failure, systemImage: "wifi.exclamationmark").foregroundStyle(Color.quietText)
+                    Button("Try again") { Task { await center.refresh() } }.frame(minHeight: CardMetrics.minTouch)
+                }
+            }
+            if let audit = center.audit {
+                Section("Weekly reply audit") {
+                    Text("Caught \(audit.caught) \u{B7} Missed \(audit.missed) \u{B7} Not important \(audit.noise) \u{B7} Unknown chat \(audit.unknownChat)")
+                        .font(.callout).fixedSize(horizontal: false, vertical: true)
+                    Text("Caught means viewed or delivered before your reply. Missed means no such evidence. Verified email and Matrix replies are included. Chat sources without trusted identity and reply timing remain unknown.")
+                        .font(.caption).foregroundStyle(Color.quietText)
+                }
+            }
+            if !center.later.isEmpty {
+                Section("Snoozed and hidden") { ForEach(center.later) { NudgeCardView(center: center, item: $0) } }
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("Attention")
+        .task { await center.refresh() }
+    }
+}
+
+struct NudgeCardView: View {
+    let center: NudgeCenter
+    let item: OmniNudge
+    @Environment(\.navigator) private var navigator
+    @Environment(\.openURL) private var openURL
+    @State private var showHealth = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(NudgeKind.label(item.candidate.kind))
+                .font(.caption.weight(.semibold))
+                .textCase(.uppercase)
+                .foregroundStyle(Color.quietText)
+                .accessibilityLabel("Kind: \(NudgeKind.label(item.candidate.kind))")
+            Text(item.candidate.title).font(.headline)
+            MarkdownText(markdown: item.candidate.summary).textSelection(.enabled)
+            Text(item.candidate.reasons.joined(separator: " · ")).font(.callout).foregroundStyle(.secondary)
+            ViewThatFits(in: .horizontal) {
+                HStack { primaryActions }
+                VStack(alignment: .leading) { primaryActions }
+            }.controlSize(.regular).fixedSize(horizontal: false, vertical: true)
+            ViewThatFits(in: .horizontal) {
+                HStack { openThreadAction; sourceAction; Spacer(minLength: 8); moreActions }
+                VStack(alignment: .leading) { openThreadAction; sourceAction; moreActions }
+            }.buttonStyle(.borderless).font(.callout)
+
+        }
+        .padding().background(.background, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(.quaternary, lineWidth: 1))
+        .disabled(center.busy.contains(item.id))
+        .sheet(isPresented: $showHealth) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Pipeline status").font(.title2)
+                Text(item.candidate.operationalSource?.subsystem ?? "Pipeline").font(.headline)
+                Text(item.candidate.summary)
+                if let last = item.candidate.operationalSource?.lastSeen, last > 0 {
+                    Text("Last source update: \(Date(timeIntervalSince1970: last / 1000).formatted())").font(.callout)
+                } else { Text("No source update found in the complete inventory.").font(.callout) }
+                Text("Checked: \(Date(timeIntervalSince1970: item.updatedAt / 1000).formatted())").font(.caption).foregroundStyle(Color.quietText)
+                Button("Done") { showHealth = false }.frame(minHeight: 44)
+            }.padding().frame(minWidth: 280, idealWidth: 400)
+        }
+        .task(id: item.updatedAt) { await center.markSeen(item.id, updatedAt: item.updatedAt) }
+    }
+    /// The conversation this nudge already has (as an approval card's "Open thread").
+    @ViewBuilder private var openThreadAction: some View {
+        if let threadID = item.threadId {
+            Button { navigator.open(.thread(threadID)) } label: { Text("Open").frame(minHeight: 44).contentShape(Rectangle()) }
+                .accessibilityLabel("Open conversation")
+                .accessibilityHint("Opens the conversation for this item")
+                .accessibilityIdentifier("nudge.open")
+        }
+    }
+    @ViewBuilder private var sourceAction: some View {
+        if let source = item.candidate.operationalSource {
+            if source.kind == "job" {
+                Button { navigator.open(.recurring) } label: { Text("Open Recurring").frame(minHeight: 44).contentShape(Rectangle()) }
+            } else {
+                Button { showHealth = true } label: { Text("Open status").frame(minHeight: 44).contentShape(Rectangle()) }
+            }
+        } else if let link = PrismSourceLink(web: item.sourceLink, noteID: item.candidate.sourceId) {
+            Button {
+                SourceLinkOpener.open(link, with: openURL)
+            } label: { Text("Open source").frame(minHeight: 44).contentShape(Rectangle()) }
+            .contextMenu { Button("Open in Browser") { openURL(link.web) } }
+        }
+    }
+    private var moreActions: some View {
+        Menu {
+            Button("Snooze one day") { Task { await center.act(item.id, .snooze, until: Date().addingTimeInterval(86400)) } }
+            Button("Not important") { Task { await center.act(item.id, .noise) } }
+            Button("Relevant") { Task { await center.act(item.id, .relevant) } }
+            Button("Hide") { Task { await center.act(item.id, .dismiss) } }
+        } label: { Label("More", systemImage: "ellipsis").frame(minWidth: 44, minHeight: 44).contentShape(Rectangle()) }
+        .accessibilityLabel("More nudge actions")
+    }
+    @ViewBuilder private var primaryActions: some View {
+        if ["reply-owed", "unprocessed"].contains(item.candidate.kind) && item.candidate.operationalSource == nil {
+            Button { start(.draftReply) } label: { Text("Draft reply").frame(minHeight: 32).contentShape(Rectangle()) }.buttonStyle(.bordered)
+        }
+        Button { start(.startWorking) } label: { Text("Start working").frame(minHeight: 32).contentShape(Rectangle()) }.buttonStyle(.borderedProminent)
+    }
+    private func start(_ action: NudgeStart) {
+        Task { if let thread = await center.start(item.id, action) { navigator.open(.thread(thread)) } }
+    }
+}

@@ -1,0 +1,18 @@
+name: omni-bridge
+version: "2.0"
+description: >-
+  The Omni surface of Hermes (the API server the Prism Server's Omni gateway
+  drives). Gives Omni turns Hermes' full tools with guarded edges: every shell
+  command runs in an OS sandbox (no credentials, no network, writes only in the
+  workspace); sends are refused and drafted with `omni_propose` instead; egress,
+  installs, restarts, deletes and other system changes pause for an approval
+  card in the Omni app. The rules are one table (guard_table.py), documented in
+  docs/omni/tool-policy.md. Defines the `omni-full` toolset (the Telegram
+  agent's tools), which exists only while this plugin is loaded and its
+  self-test passes: `platform_toolsets.api_server: [omni-full, omni]`. Also tells the gateway when a turn ran on an Omni
+  thread from another surface. Inert without OMNI_SERVICE_TOKEN, in Buzz relay
+  processes, and on every turn that is not an Omni turn (Telegram, desktop, CLI,
+  and cron jobs those surfaces created).
+provides_tools:
+  - omni_propose
+  - omni_card

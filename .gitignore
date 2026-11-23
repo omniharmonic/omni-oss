@@ -1,0 +1,20 @@
+# Your identity and secrets never go in git.
+agent/config/identity.yaml
+.env
+*.env
+**/.env
+# Build products
+.build/
+.swiftpm/
+xcuserdata/
+DerivedData/
+__pycache__/
+*.pyc
+qa/
+# Runtime data never goes in git: memory, state, outputs, logs.
+agent/memory/*
+!agent/memory/README.md
+agent/state/
+agent/outputs/
+*.log
+*.sqlite3

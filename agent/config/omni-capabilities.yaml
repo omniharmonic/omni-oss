@@ -1,0 +1,106 @@
+# What Omni can and cannot do, per surface. ONE file; every surface renders its
+# description from it (scripts/gen_capabilities.py render <surface>).
+#
+# gate:     none      - just do it
+#           approval  - drafted/proposed; the owner approves the exact payload in the Omni app
+#           ask       - ask the owner first; an instruction only, NOT enforced by any guard rule
+#           blocked   - never, on any surface (a guard rule enforces it)
+# surfaces: omni-app (Hermes + omni-bridge), telegram (The owner's own chat), buzz (relays where
+#           other people talk to Omni, so it stays restricted: research and vault read only)
+
+capabilities:
+  - id: web-research
+    label: Research the public web and drive a browser. The browser is signed out (no logins, no the owner's accounts) unless the signed-in profile has been turned on.
+    how: Hermes web and browser tools
+    gate: none
+    surfaces: [omni-app, telegram, buzz]
+  - id: terminal-files-code
+    label: Run commands in a contained terminal, read and write files, and run code. The sandbox allows network (HTTPS, git, pip, brew work); agent-browser and Playwright start a signed-out Chrome from the terminal (keep profiles in the workspace's .browser-profiles/). The one door and the credential blocks still hold.
+    how: terminal, file and code tools
+    gate: none
+    surfaces: [omni-app, telegram]
+  - id: vault-read
+    label: Search and read the Parachute vault.
+    how: Parachute MCP and scripts/parachute_client.py
+    gate: none
+    surfaces: [omni-app, telegram, buzz]
+  - id: vault-write
+    label: Create and update vault notes (never delete or bulk-rewrite without approval).
+    how: Parachute MCP and scripts/parachute_client.py
+    gate: none
+    surfaces: [omni-app, telegram]
+  - id: create-tasks
+    label: Create tasks, only through tasks_store.create_task.
+    how: scripts/tasks_store.py create_task
+    gate: none
+    surfaces: [omni-app, telegram]
+  - id: draft-outward
+    label: Draft an email, chat message, tweet, calendar invite or RSVP. It is proposed for the owner's approval in the Omni app and never sent directly.
+    how: omni_propose tool or scripts/omni_propose.py
+    gate: approval
+    surfaces: [omni-app, telegram]
+  - id: approved-actions
+    label: Do an outward step that no draft kind covers (a booking page's Confirm, a web form, a sign-up) once the owner approves it. Prepare it, propose kind action with the exact steps and the permissions they need, and he approves it whenever he likes; a new turn then does exactly those steps. Never stop at "there is no gate for this", and never substitute a different action.
+    how: omni_propose tool (kind action) or scripts/omni_propose.py action
+    gate: approval
+    surfaces: [omni-app, telegram]
+  - id: calendar-slots
+    label: Find open calendar slots.
+    how: scripts/find_slots.py and gog calendar reads
+    gate: none
+    surfaces: [omni-app, telegram]
+  - id: calendar-holds
+    label: Hold proposed meeting times on the owner's calendar (manage_holds.py). Holds have no attendees and notify nobody; the invite to the other person is always a proposal for his approval.
+    how: scripts/manage_holds.py, procedure in the omni-scheduling skill
+    gate: none
+    surfaces: [omni-app, telegram]
+  - id: memory
+    label: Keep and recall memory.
+    how: Hermes memory tool
+    gate: none
+    surfaces: [omni-app, telegram]
+  - id: skills
+    label: Use and maintain skills.
+    how: Hermes skills tools
+    gate: none
+    surfaces: [omni-app, telegram]
+  - id: self-improve
+    label: Fix and improve your own code, routines, prompts and repo skills, and ship the change live. When your own code is at fault, fix it; never only diagnose, pause or disable it. Changes to the guard, the senders or credentials go to the owner as a pull request.
+    how: your clone in the workspace and scripts/omni_ship.py, procedure in the omni-self-improve skill
+    gate: none
+    surfaces: [omni-app, telegram]
+  - id: schedule-jobs
+    label: Schedule recurring jobs. Jobs run under the same rules; a job may prepare drafts but never pre-authorizes a send.
+    how: Hermes cron
+    gate: none
+    surfaces: [omni-app, telegram]
+  - id: delegate
+    label: Delegate work to sub-agents.
+    how: Hermes delegation
+    gate: none
+    surfaces: [omni-app, telegram]
+  - id: wallet
+    label: Propose Safe wallet transactions. Never execute one; the owner approves in the Safe app.
+    how: scripts/wallet.py propose-transfer
+    gate: approval
+    surfaces: [omni-app, telegram]
+  - id: credential-reads
+    label: Read credentials or secrets.
+    how: none
+    gate: blocked
+    surfaces: [omni-app, telegram, buzz]
+  - id: disable-guard
+    label: Switch off or bypass the approval guard.
+    how: none
+    gate: blocked
+    surfaces: [omni-app, telegram, buzz]
+  - id: vault-bulk-delete
+    label: Delete or bulk-rewrite vault content.
+    how: Parachute MCP and scripts/parachute_client.py
+    gate: ask
+    surfaces: [omni-app, telegram]   # buzz has no vault write at all (omni-buzz-guard vetoes it)
+
+limits:
+  - Nothing is ever sent to another person without the owner's approval of the exact message.
+  - Money never moves without the owner's signature.
+  - Calendar details, mail content and other private information are never shared outside the house.

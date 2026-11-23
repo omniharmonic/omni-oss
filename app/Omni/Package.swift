@@ -1,0 +1,53 @@
+// swift-tools-version: 6.2
+// Omni — the native client for your own agent (macOS first, iOS compiling).
+// Builds on PrismKit (from Prism) and the local OmniVoiceKit package.
+import PackageDescription
+
+// PrismKit lives in the Prism repository (swift/PrismKit). Default: a Prism checkout next to this
+// repository; override with PRISMKIT_PATH (absolute, or relative to app/Omni).
+let prismKitPath = Context.environment["PRISMKIT_PATH"] ?? "../../../prism/swift/PrismKit"
+
+let package = Package(
+    name: "Omni",
+    platforms: [.macOS(.v26), .iOS(.v26)],
+    products: [
+        .library(name: "OmniCore", targets: ["OmniCore"]),
+        .library(name: "OmniUI", targets: ["OmniUI"]),
+        .executable(name: "OmniSmoke", targets: ["OmniSmoke"]),
+    ],
+    dependencies: [
+        .package(path: prismKitPath),
+        .package(path: "../OmniVoiceKit"),
+    ],
+    targets: [
+        // View models, stores and navigation state. No SwiftUI; tested with fake clients.
+        .target(
+            name: "OmniCore",
+            dependencies: [
+                .product(name: "PrismAuth", package: "PrismKit"),
+                .product(name: "PrismTransport", package: "PrismKit"),
+                .product(name: "OmniClient", package: "PrismKit"),
+            ]
+        ),
+        // The shared SwiftUI screens. The app target (App/, Omni.xcodeproj) is a thin shell.
+        .target(name: "WakeAudioBridge"),
+        .target(name: "WakeAudioBridgeTestSupport", dependencies: ["WakeAudioBridge"], path: "Tests/WakeAudioBridgeTestSupport"),
+        .target(name: "OmniUI", dependencies: ["WakeAudioBridge", "OmniCore", .product(name: "OmniVoiceKit", package: "OmniVoiceKit"), .product(name: "PrismModels", package: "PrismKit")]),
+        // A command-line walk through the same calls the app makes, against the laptop dev
+        // gateway only (Scripts/smoke.sh).
+        .executableTarget(
+            name: "OmniSmoke",
+            dependencies: [
+                "OmniCore",
+                .product(name: "PrismAuth", package: "PrismKit"),
+                .product(name: "PrismTransport", package: "PrismKit"),
+                .product(name: "OmniClient", package: "PrismKit"),
+            ]
+        ),
+        .testTarget(name: "OmniCoreTests", dependencies: ["OmniCore"]),
+        // Renders the Mac screens off-screen from sample data and writes PNGs (TESTING.md).
+        // No server, no window on screen.
+        .testTarget(name: "OmniUISnapshotTests", dependencies: ["OmniUI", "OmniCore", "WakeAudioBridgeTestSupport"], resources: [.copy("Fixtures")]),
+    ],
+    swiftLanguageModes: [.v6]
+)

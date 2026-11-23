@@ -1,0 +1,14 @@
+name: omni-meet
+version: "1.0"
+description: >-
+  Omni attends Google Meet meetings the owner approves (from its own Google account, its address added to
+  the invite), keeps a caption transcript, and speaks only in meetings where speaking is separately
+  approved — only when addressed by name, under strict rules, with verbatim text-to-speech and every line
+  reported to the owner. Uses Hermes' google_meet bot as a library; the stock google_meet plugin stays off.
+provides_tools:
+  - omni_meet_attend
+  - omni_meet_allow_speech
+  - omni_meet_say
+  - omni_meet_status
+  - omni_meet_transcript
+  - omni_meet_cancel

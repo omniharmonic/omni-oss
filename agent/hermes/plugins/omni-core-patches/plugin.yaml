@@ -1,0 +1,9 @@
+name: omni-core-patches
+version: "1.0"
+description: >-
+  Omni's fixes to Hermes core, applied at load time from a plugin so that
+  `hermes update` never wipes them (a plugin lives outside the Hermes
+  checkout). Each patch checks that the code it wraps still looks the way it
+  expects, steps aside when upstream has fixed the problem itself, and logs
+  exactly which state it is in. Fails open: a patch that cannot apply leaves
+  Hermes running unpatched and says so in agent.log.

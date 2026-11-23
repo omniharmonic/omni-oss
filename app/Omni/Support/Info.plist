@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Merged with the keys Xcode generates (GENERATE_INFOPLIST_FILE). -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<!-- Plain http only to this machine: the laptop dev gateway on 127.0.0.1.
+		     PrismKit's ServerOrigin refuses http to any other host, and refuses it
+		     entirely in an iOS release build. -->
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>CFBundleURLTypes</key>
+    <array><dict><key>CFBundleURLSchemes</key><array><string>omni</string></array></dict></array>
+	<!-- Only Apple's standard HTTPS/TLS: exempt from export documentation. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Omni uses Face ID to unlock private conversations and confirm actions you approve.</string>
+	<key>NSMicrophoneUsageDescription</key><string>Talk to Omni using the microphone. On Mac, you can also choose to enable local Hey Omni listening.</string>
+	<key>NSSpeechRecognitionUsageDescription</key><string>Recognize your speech on this device for voice conversations and optional Hey Omni activation on Mac.</string>
+</dict>
+</plist>

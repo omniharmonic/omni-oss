@@ -1,0 +1,234 @@
+import Foundation
+import OmniClient
+
+/// Exactly what an approval would send, laid out for reading. Every key of the payload is
+/// shown: the ones this build knows get a label, anything else is listed as it is, so a
+/// field can never ride along unseen.
+public struct ApprovalContent: Equatable, Sendable {
+    public struct Field: Equatable, Sendable, Identifiable {
+        public let key: String
+        public let label: String
+        public let value: String
+        public var id: String { key }
+    }
+
+    /// "Email", "Reply", "Message", …
+    public let kindLabel: String
+    /// Recipients, subject, times, amounts — the short fields, in reading order.
+    public let fields: [Field]
+    /// The long text (an email's body, a tweet's text), untruncated.
+    public let body: String?
+    /// The payload key ``body`` came from.
+    public let bodyKey: String?
+    /// Draft recipients who were not on the item it answers, as written (sorted). Their entries in
+    /// ``fields`` read "<address> (New recipient)".
+    public let newRecipients: [String]
+    /// A device sign-in's matching code (`matchCode`, e.g. "482 913"), shown on the sign-in
+    /// page the request came from. The owner compares the two before approving: a card
+    /// whose code differs from — or is missing on — his sign-in page is someone else's.
+    public let matchCode: String?
+    /// What to do with ``matchCode`` (device sign-ins only): the instruction when there is a
+    /// code, a warning when there is none.
+    public var matchCodeNotice: String? {
+        guard kindLabel == Self.deviceSignInLabel else { return nil }
+        return matchCode == nil ? Self.noMatchCodeWarning : Self.matchCodeInstruction
+    }
+
+    /// One line for a list row: "Email to kevin@example.com".
+    public var headline: String {
+        if let what = fields.first(where: { $0.key == "title" }), kindLabel == "Command" || kindLabel == "Action" { return what.value }
+        if kindLabel == Self.deviceSignInLabel {
+            return fields.first(where: { $0.key == "label" }).map { "\(kindLabel): \($0.value)" } ?? kindLabel
+        }
+        if let to = fields.first(where: { ["to", "expectTo", "attendees", "roomId"].contains($0.key) }) {
+            return "\(kindLabel) to \(to.value)"
+        }
+        return kindLabel
+    }
+
+    public init(_ approval: Approval) {
+        self.init(kind: approval.kind, payload: approval.payload, newRecipients: approval.newRecipients)
+    }
+
+    /// The payload keys that hold people a draft goes to.
+    static let recipientKeys: Set<String> = ["to", "cc", "expectTo", "attendees"]
+
+    public init(kind: ApprovalKind, payload: JSONValue, newRecipients: Set<String> = []) {
+        let spec = Self.spec(for: kind)
+        kindLabel = spec.label
+        let object = payload.objectValue ?? [:]
+        var fields: [Field] = []
+        var seen = Set<String>()
+        if kind == .deviceSignIn, let code = object["matchCode"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !code.isEmpty {
+            // Shown on its own, at the top (not as one more row), and not repeated below.
+            matchCode = code
+            seen.insert("matchCode")
+        } else {
+            matchCode = nil
+        }
+        for (key, label) in spec.fields {
+            seen.insert(key)
+            guard let value = object[key], !value.isNull else { continue }
+            let text = Self.text(value)
+            let marked = Self.recipientKeys.contains(key) && kind != .walletProposal && !newRecipients.isEmpty
+                ? value.stringArrayValue.map { list in list.map { newRecipients.contains($0) ? "\($0) (\(CardText.newRecipient))" : $0 }.joined(separator: ", ") }
+                : nil
+            let display = kind == .command && key == "origin" ? Self.askedBy(text)
+                : Self.timeKeys.contains(key) ? Self.momentText(text) ?? text : marked ?? text
+            fields.append(Field(key: key, label: label, value: display))
+        }
+        var body: String?
+        if let key = spec.body {
+            seen.insert(key)
+            if let value = object[key], !value.isNull { body = Self.text(value) }
+        }
+        // Whatever else the payload carries is shown too.
+        for key in object.keys.sorted() where !seen.contains(key) {
+            fields.append(Field(key: key, label: key, value: Self.text(object[key] ?? .null)))
+        }
+        if payload.objectValue == nil {
+            fields.append(Field(key: "payload", label: "Content", value: Self.text(payload)))
+        }
+        self.fields = fields
+        self.body = body
+        self.bodyKey = body == nil ? nil : spec.body
+        self.newRecipients = newRecipients.sorted()
+    }
+
+    struct Spec {
+        let label: String
+        let fields: [(key: String, label: String)]
+        let body: String?
+    }
+
+    static func spec(for kind: ApprovalKind) -> Spec {
+        switch kind {
+        case .email:
+            return Spec(label: "Email", fields: [("to", "To"), ("cc", "Cc"), ("subject", "Subject")], body: "body")
+        case .emailReply:
+            return Spec(label: "Reply", fields: [("expectTo", "To"), ("cc", "Cc"), ("noteId", "In reply to")], body: "body")
+        case .message:
+            return Spec(label: "Message", fields: [("roomId", "Room")], body: "body")
+        case .calendarRSVP:
+            return Spec(label: "Calendar RSVP", fields: [("eventId", "Event"), ("response", "Response")], body: nil)
+        case .calendarInvite:
+            return Spec(label: "Invite", fields: [("title", "Title"), ("start", "Starts"), ("end", "Ends"), ("attendees", "Attendees"), ("location", "Where")], body: "description")
+        case .tweet:
+            return Spec(label: "Tweet", fields: [], body: "text")
+        case .walletProposal:
+            return Spec(label: "Wallet proposal", fields: [("to", "To"), ("amount", "Amount"), ("token", "Token"), ("chain", "Chain")], body: "purpose")
+        case .deviceSignIn:
+            // Someone is signing a new device in as the owner. The name is what that device
+            // says about ITSELF — labelled as a claim; where it returns to and when it asked
+            // are facts the server recorded.
+            return Spec(label: deviceSignInLabel, fields: [("label", "Device (its own name for itself)"), ("redirectUri", "Returns to"), ("requestedAt", "Requested"), ("ipHint", "From (approximate)"), ("userAgentHint", "App or browser"), ("clientId", "Client")], body: nil)
+        case .action:
+            // What will happen, whom it reaches, where, what it may do without asking again; then
+            // the exact steps it will follow (the grant ids are listed below as they are).
+            return Spec(label: "Action", fields: [("title", "What"), ("reaches", "Reaches"), ("url", "Where"), ("permissions", "May, without asking again")], body: "steps")
+        case .command:
+            // What was flagged and why, then the exact command (any other tool's whole input
+            // is listed below as it is — nothing rides along unseen).
+            return Spec(label: "Command", fields: [("title", "What"), ("reason", "Why"), ("tool", "Tool"), ("cwd", "In"), ("origin", "Asked by")], body: "command")
+        default:
+            let words = kind.rawValue.replacingOccurrences(of: "-", with: " ")
+            return Spec(label: words.prefix(1).uppercased() + words.dropFirst(), fields: [], body: nil)
+        }
+    }
+
+    /// Who is asking, in words: a paused command can come from the conversation itself (no
+    /// `origin`), from a sub-agent it started, or from a scheduled job it created. An origin
+    /// this build does not know is shown as it came.
+    static func askedBy(_ origin: String) -> String {
+        switch origin {
+        case "subagent": return "A sub-agent this conversation started"
+        case "cron": return "A scheduled job this conversation created"
+        default: return origin
+        }
+    }
+
+    /// The payload keys this build gives a label to, for a kind.
+    public static func shownKeys(for kind: ApprovalKind) -> [String] {
+        let spec = spec(for: kind)
+        return spec.fields.map(\.key) + (spec.body.map { [$0] } ?? [])
+    }
+
+    /// The payload keys that hold a moment (RFC 3339) and are shown as a date and time.
+    static let timeKeys: Set<String> = ["start", "end", "requestedAt"]
+
+    /// The kind label of a device sign-in (also its card's header).
+    public static let deviceSignInLabel = "Sign in a new device"
+    /// The caption above a device sign-in's matching code.
+    public static let matchCodeCaption = "Code on the sign-in page"
+    public static let matchCodeInstruction = "Approve only if this code matches the one on the sign-in page"
+    public static let noMatchCodeWarning = "No matching code — do not approve unless you are sure"
+
+    /// "Wed, Oct 14, 2026 at 10:00 AM MDT" for a stored RFC 3339 moment: the same instant,
+    /// in this device's zone, with the zone named. nil when the text is not a moment — it is
+    /// then shown exactly as stored.
+    public static func momentText(_ stored: String, timeZone: TimeZone = .current, locale: Locale = .current) -> String? {
+        guard let date = PrismJSON.parseDate(stored) else { return nil }
+        var style = Date.FormatStyle.dateTime.weekday(.abbreviated).month(.abbreviated).day().year().hour().minute().timeZone()
+        style.timeZone = timeZone
+        style.locale = locale
+        return date.formatted(style)
+    }
+
+    /// A value as text: strings as they are, lists of strings joined, anything else as its
+    /// canonical JSON (never dropped).
+    static func text(_ value: JSONValue) -> String {
+        if let s = value.stringValue { return s }
+        if let list = value.stringArrayValue { return list.joined(separator: ", ") }
+        return value.canonicalJSON
+    }
+}
+
+/// Editing a pending draft. Only the text a person would reword is editable; recipients,
+/// times and amounts are not (a changed recipient is a new request to the agent, made with
+/// Revise). The gateway validates the result per kind.
+public struct ApprovalDraft: Equatable, Sendable, Identifiable {
+    /// Stable while one draft is being edited (a sheet's identity).
+    public var id: String { fields.map(\.key).joined(separator: ",") }
+
+    public struct TextField: Equatable, Sendable, Identifiable {
+        public let key: String
+        public let label: String
+        public let multiline: Bool
+        public var text: String
+        public var id: String { key }
+    }
+
+    public var fields: [TextField]
+    private let original: JSONValue
+
+    public static func editableKeys(for kind: ApprovalKind) -> [(key: String, label: String, multiline: Bool)] {
+        switch kind {
+        case .email: return [("subject", "Subject", false), ("body", "Body", true)]
+        case .emailReply, .message: return [("body", "Body", true)]
+        case .calendarInvite: return [("title", "Title", false), ("location", "Where", false), ("description", "Description", true)]
+        case .tweet: return [("text", "Text", true)]
+        default: return []
+        }
+    }
+
+    /// nil when this kind has nothing editable here.
+    public init?(_ approval: Approval) {
+        guard let object = approval.payload.objectValue else { return nil }
+        let fields = Self.editableKeys(for: approval.kind).compactMap { spec -> TextField? in
+            guard let text = object[spec.key]?.stringValue else { return nil }
+            return TextField(key: spec.key, label: spec.label, multiline: spec.multiline, text: text)
+        }
+        guard !fields.isEmpty else { return nil }
+        self.fields = fields
+        self.original = approval.payload
+    }
+
+    /// The payload with the edited text put back; every other key untouched.
+    public var payload: JSONValue {
+        guard var object = original.objectValue else { return original }
+        for field in fields { object[field.key] = .string(field.text) }
+        return .object(object)
+    }
+
+    public var hasChanges: Bool { payload != original }
+}

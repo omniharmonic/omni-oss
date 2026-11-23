@@ -1,0 +1,433 @@
+import OmniClient
+import OmniCore
+import SwiftUI
+
+/// One thread: its transcript and the composer.
+struct ThreadView: View {
+    let session: SessionModel
+    @Bindable var model: ThreadModel
+    @State private var voiceExpanded = false
+    @Environment(\.scenePhase) private var scenePhase
+    init(session: SessionModel, model: ThreadModel) {
+        self.session = session; self.model = model
+        _voiceExpanded = State(initialValue: session.voiceThreadID == model.threadID)
+    }
+
+    var body: some View {
+        GeometryReader { area in
+            // Keep the composer and voice owner stable while the transcript changes
+            // from loading to loaded (or an error).
+            ZStack { transcript }
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    if !model.isUnavailable {
+                        VStack(spacing: 0) {
+                            banners
+                            Divider()
+                            ConversationVoiceControl(session: session, model: model, expanded: $voiceExpanded,
+                                                     maximumHeight: max(120, min(280, area.size.height * 0.42)))
+                            Composer(
+                                text: $model.draft,
+                                placeholder: "Message Omni…",
+                                canSend: model.canSend,
+                                isRunning: model.isRunning,
+                                isStopping: model.isStopping,
+                                onSend: { Task { await model.send() } },
+                                onStop: { Task { await model.stop() } }
+                            )
+                            .fixedSize(horizontal: false, vertical: true)
+                        }
+                        // Keep scrolling messages from showing through the voice/composer dock.
+                        .background(Color.composerSurface)
+                    }
+                }
+        }
+        .navigationTitle(barTitle)
+        #if os(iOS)
+        // A thread's own title, whole, in the bar; its state under it. (A label in the bar
+        // was cut down to a sliver on an iPhone.)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                let state = model.thread.map { $0.gone ? "No longer available" : ThreadGrouping.title(for: $0.state) }
+                // Voice and New Chat share the bar. The title and its state on one line each when
+                // the title fits; a longer title takes both lines instead of being cut (its state
+                // is still read out, and shown in the list).
+                ViewThatFits(in: .horizontal) {
+                    VStack(spacing: 0) {
+                        Text(barTitle).font(.headline).lineLimit(1).fixedSize(horizontal: true, vertical: false)
+                        if let state {
+                            Text(state).font(.caption).foregroundStyle(Color.quietText)
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                    }
+                    Text(barTitle).font(.subheadline.weight(.semibold))
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+                        .minimumScaleFactor(0.8)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .accessibilityLabel(state.map { "\(barTitle), \($0)" } ?? barTitle)
+                // A bar does not grow with the text size (the system shows its items large
+                // on a long press instead); held to sizes that fit it.
+                .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+                .accessibilityElement(children: .combine)
+                .accessibilityAddTraits(.isHeader)
+            }
+        }
+        #else
+        .toolbar {
+            if let thread = model.thread {
+                ToolbarItem {
+                    Label(ThreadGrouping.title(for: thread.state), systemImage: StateStyle.symbol(thread.state))
+                        .labelStyle(.titleAndIcon)
+                        .font(.callout)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .foregroundStyle(Color.quietText)
+                        // The glass toolbar also contains Voice. Keep the state's
+                        // short label whole while the navigation title can truncate.
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .layoutPriority(1)
+                        .accessibilityLabel("State: \(ThreadGrouping.title(for: thread.state))")
+                }
+            }
+        }
+        #endif
+        .toolbar {
+            // Voice here talks in this thread; New Chat leaves it for a new one.
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button("Voice", systemImage: "waveform") {
+                    session.showVoice(in: model.threadID); voiceExpanded = true
+                }
+                .labelStyle(.iconOnly)
+                .accessibilityLabel("Voice")
+                .accessibilityIdentifier("voice.open")
+                .disabled(model.isUnavailable)
+                NewChatButton(session: session)
+            }
+        }
+        .onAppear {
+            model.setSceneActive(scenePhase == .active && !PrivacyLock.shared.locked)
+        }
+        .onChange(of: scenePhase) { model.setSceneActive(scenePhase == .active && !PrivacyLock.shared.locked) }
+        .onChange(of: PrivacyLock.shared.locked) { model.setSceneActive(scenePhase == .active && !PrivacyLock.shared.locked) }
+        .task(id: model.threadID) { await session.openThread(model) }
+        .onDisappear { model.close() }
+    }
+
+    /// The thread's title; the list's, while the thread itself has not loaded (or never will).
+    private var barTitle: String {
+        model.thread == nil ? session.threads.thread(model.threadID).map(ThreadGrouping.displayTitle) ?? model.title : model.title
+    }
+
+    @ViewBuilder private var transcript: some View {
+        switch model.phase {
+        case .idle, .loading:
+            ProgressView("Loading the thread…").frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .failed where model.isUnavailable:
+            // The agent no longer has it: say so once, and offer the way out. Nothing retries.
+            ContentUnavailableView {
+                Label("This conversation is no longer available", systemImage: "bubble.left.and.exclamationmark.bubble.right")
+            } description: {
+                Text("The agent no longer has it, so it can't be opened or continued. You can remove it from your list.")
+                if let problem = session.threads.removeError {
+                    Text(problem).foregroundStyle(.red)
+                }
+            } actions: {
+                Button("Remove from List") { Task { await session.removeThread(model.threadID) } }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(session.threads.removingID != nil)
+                    .accessibilityHint("Takes this thread out of your list")
+                Button("Check Again") { Task { await model.checkAgain() } }
+                    .accessibilityHint("Asks the server for this conversation once more")
+            }
+        case .failed(let message):
+            ContentUnavailableView {
+                Label("Couldn't open this thread", systemImage: "exclamationmark.bubble")
+            } description: {
+                Text(message)
+            } actions: {
+                Button("Try Again") { Task { await model.checkAgain() } }
+            }
+        case .loaded:
+            ScrollViewReader { proxy in
+                ScrollView {
+                    // Eager, not lazy (owner report 2026-11-17): a LazyVStack places the opening offset
+                    // from ESTIMATED row heights, so a long thread could open past its real end on a
+                    // blank screen until scrolled up. A thread holds at most 200 stored messages.
+                    VStack(alignment: .leading, spacing: 14) {
+                        if model.timeline.isEmpty {
+                            Text("Nothing here yet.").foregroundStyle(Color.quietText).frame(maxWidth: .infinity)
+                        }
+                        ForEach(model.timeline) { item in
+                            TimelineRow(item: item, model: model, approvals: session.approvals, cards: session.cards)
+                        }
+                        Color.clear.frame(height: 1).id("bottom")
+                    }
+                    .padding()
+                    .frame(maxWidth: 820, alignment: .leading)
+                    .frame(maxWidth: .infinity)
+                }
+                // A short conversation starts at the top; a long one opens at its end and
+                // stays there as the answer grows.
+                .defaultScrollAnchor(.top, for: .alignment)
+                .defaultScrollAnchor(.bottom, for: .initialOffset)
+                .defaultScrollAnchor(.bottom, for: .sizeChanges)
+                .accessibilityIdentifier("transcript")
+                #if os(iOS)
+                // Dragging the conversation puts the keyboard away (there is no other way to on an iPhone).
+                .scrollDismissesKeyboard(.interactively)
+                #endif
+                .refreshable { await model.reload() }
+                .onChange(of: model.timeline) { proxy.scrollTo("bottom", anchor: .bottom) }
+                // The keyboard came up, or the message box grew: the room for the conversation
+                // shrank, and its end must not slide under the box.
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { old, new in
+                    if new < old { proxy.scrollTo("bottom", anchor: .bottom) }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var banners: some View {
+        if model.connection == .reconnecting {
+            Banner(symbol: "arrow.triangle.2.circlepath", text: "Reconnecting… Omni keeps working on the server.")
+        }
+        if let problem = model.streamProblem {
+            Banner(symbol: "exclamationmark.triangle", text: problem) {
+                Button("Reload") { Task { await model.reload() } }
+            }
+        }
+        if case .failed(let message) = model.sendState {
+            Banner(symbol: "exclamationmark.bubble", text: message) {
+                Button("Try Again") { Task { await model.retrySend() } }
+                    .accessibilityHint("Sends the same message again; it cannot be delivered twice")
+                Button("Edit") { model.discardPending() }
+                    .accessibilityHint("Puts the message back in the box without sending it")
+            }
+        }
+    }
+}
+
+struct Banner<Actions: View>: View {
+    let symbol: String
+    let text: String
+    @ViewBuilder var actions: Actions
+
+    init(symbol: String, text: String, @ViewBuilder actions: () -> Actions = { EmptyView() }) {
+        self.symbol = symbol
+        self.text = text
+        self.actions = actions()
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: symbol).foregroundStyle(Color.quietText).accessibilityHidden(true)
+            Text(text).font(.callout).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            actions.controlSize(.small)
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+}
+
+/// The message box. Mac: Return sends, Shift-Return (or Option-Return) starts a new line.
+/// iPhone: Return sends; Shift-Return adds a line, and the visible Send button remains available.
+///
+/// `accessory` is the seam for the voice track: the microphone button goes there, and what
+/// it hears lands in `text` (or starts a thread with `source: "voice"`).
+struct Composer<Accessory: View>: View {
+    @Binding var text: String
+    let placeholder: String
+    let canSend: Bool
+    var isRunning = false
+    var isStopping = false
+    let onSend: () -> Void
+    var onStop: () -> Void = {}
+    /// Put the cursor in the box when it appears. Always on the Mac (a thread opens ready to
+    /// type in). On iPhone and iPad only where typing is the whole point — a new thread —
+    /// because there the cursor brings the keyboard up over half the conversation.
+    var focusOnAppear = Composer.focusesByDefault
+    @ViewBuilder var accessory: Accessory
+    @State private var focused = false
+    @Environment(\.dynamicTypeSize) private var typeSize
+
+    init(
+        text: Binding<String>,
+        placeholder: String,
+        canSend: Bool,
+        isRunning: Bool = false,
+        isStopping: Bool = false,
+        onSend: @escaping () -> Void,
+        onStop: @escaping () -> Void = {},
+        focusOnAppear: Bool = Composer.focusesByDefault,
+        @ViewBuilder accessory: () -> Accessory = { EmptyView() }
+    ) {
+        self.focusOnAppear = focusOnAppear
+        _text = text
+        self.placeholder = placeholder
+        self.canSend = canSend
+        self.isRunning = isRunning
+        self.isStopping = isStopping
+        self.onSend = onSend
+        self.onStop = onStop
+        self.accessory = accessory()
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            // An invisible copy of the text sets the height; the editor fills it.
+            Text(text.isEmpty ? placeholder : text + (text.hasSuffix("\n") ? " " : ""))
+                .font(.body)
+                // Up to eight lines, then the box scrolls. Four at the accessibility text
+                // sizes, where eight would fill the screen and push Send under the keyboard.
+                .lineLimit(1...(typeSize.isAccessibilitySize ? 4 : 8))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 5)
+                .padding(.vertical, Self.verticalInset)
+                .foregroundStyle(text.isEmpty ? AnyShapeStyle(Color.quietText) : AnyShapeStyle(.clear))
+                .accessibilityHidden(true)
+                .overlay {
+                    ReturnSendingTextView(text: $text, focused: $focused, label: placeholder, canSend: canSend, onSend: onSend)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 12))
+            accessory
+            #if os(iOS)
+            if focused {
+                Button { focused = false } label: {
+                    Image(systemName: "keyboard.chevron.compact.down")
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Hide keyboard")
+                .accessibilityIdentifier("composer.hideKeyboard")
+            }
+            #endif
+            if isRunning {
+                Button(action: onStop) {
+                    Image(systemName: "stop.circle.fill").font(.title2)
+                        .frame(width: Self.actionSize, height: Self.actionSize).contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .disabled(isStopping)
+                .help("Stop (⌘.)")
+                .accessibilityLabel("Stop")
+                .accessibilityIdentifier("composer.stop")
+                .accessibilityHint("Stops what Omni is doing in this thread")
+            } else {
+                Button(action: onSend) {
+                    Image(systemName: "arrow.up.circle.fill").font(.title2)
+                        .frame(width: Self.actionSize, height: Self.actionSize).contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(canSend ? AnyShapeStyle(.tint) : AnyShapeStyle(Color.quietText))
+                .opacity(canSend ? 1 : 0.6)
+                .disabled(!canSend)
+                .help("Send (Return)")
+                .accessibilityLabel("Send message")
+                .accessibilityIdentifier("composer.send")
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 10)
+        .background(Color.composerSurface)
+        .onAppear { if focusOnAppear { focused = true } }
+    }
+
+    static var focusesByDefault: Bool {
+        #if os(macOS)
+        true
+        #else
+        false
+        #endif
+    }
+
+    private static var actionSize: CGFloat {
+        #if os(macOS)
+        32
+        #else
+        44
+        #endif
+    }
+
+    private static var verticalInset: CGFloat {
+        #if os(macOS)
+        0
+        #else
+        8
+        #endif
+    }
+}
+
+/// ⌘N, or New Chat in any bar: an empty composer. Sending creates the thread and opens it.
+struct NewThreadView: View {
+    let session: SessionModel
+    @State private var text = ""
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Centred when there is room; scrolls under the keyboard at the largest text sizes.
+            GeometryReader { area in
+                ScrollView {
+                    ContentUnavailableView {
+                        Label(session.newThreadUsesVoice ? "New voice conversation" : "New chat", systemImage: session.newThreadUsesVoice ? "waveform" : "square.and.pencil")
+                    } description: {
+                        Text("Say what you want done. Omni works on it in its own thread and asks before anything goes out.")
+                    }
+                    .frame(maxWidth: .infinity, minHeight: area.size.height)
+                }
+                .scrollBounceBehavior(.basedOnSize)
+            }
+            if let error = session.threads.createError {
+                Banner(symbol: "exclamationmark.triangle", text: error) {
+                    Button("Dismiss") { session.threads.clearCreateError() }
+                }
+            }
+            Divider()
+            if session.newThreadUsesVoice {
+                ConversationVoiceControl(session: session, draft: $text, expanded: Binding(get: { session.newThreadUsesVoice }, set: { if !$0 { session.closeNewVoice() } }))
+            }
+            Composer(
+                text: $text,
+                placeholder: "What should Omni do?",
+                canSend: canSend,
+                onSend: {
+                    let prompt = text
+                    Task {
+                        if await session.startThread(prompt: prompt) { text = "" }
+                    }
+                },
+                focusOnAppear: !session.newThreadUsesVoice
+            )
+            .disabled(session.threads.isCreating)
+            // The box keeps the height its text needs; the words above give way.
+            .fixedSize(horizontal: false, vertical: true)
+            .layoutPriority(1)
+        }
+        .navigationTitle("New Chat")
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
+    }
+
+    private var canSend: Bool {
+        !session.threads.isCreating && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
+private extension Color {
+    static var composerSurface: Color {
+        #if os(iOS)
+        Color(uiColor: .systemBackground)
+        #else
+        Color(nsColor: .windowBackgroundColor)
+        #endif
+    }
+}

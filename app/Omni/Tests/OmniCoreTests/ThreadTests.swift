@@ -1,0 +1,775 @@
+import Foundation
+import OmniClient
+@testable import OmniCore
+import PrismTransport
+import XCTest
+
+@MainActor
+final class ThreadListTests: XCTestCase {
+    func testUnknownRuntimeHistoryUsesNeutralConversationGroup() {
+        let thread: OmniThread = Fixture.decode(["id": "history", "state": "conversation", "title": "Past chat"])
+        XCTAssertEqual(ThreadGrouping.sections([thread]).map(\.title), ["Conversations"])
+        XCTAssertEqual(ThreadGrouping.title(for: thread.state), "Conversations")
+    }
+
+    func testSectionsFollowTheSpecOrderAndWords() {
+        let threads = [
+            Fixture.thread("a", state: "done"),
+            Fixture.thread("b", state: "working"),
+            Fixture.thread("c", state: "needs-you"),
+            Fixture.thread("d", state: "scheduled"),
+            Fixture.thread("e", state: "waiting"),
+            Fixture.thread("f", state: "working"),
+        ]
+        let sections = ThreadGrouping.sections(threads)
+        XCTAssertEqual(sections.map(\.title), ["Needs you", "Working", "Waiting", "Scheduled", "Replied"])
+        // The server's order is kept inside a group.
+        XCTAssertEqual(sections[1].threads.map(\.id), ["b", "f"])
+    }
+
+    func testAnUnknownStateIsShownUnderItsOwnWordAndArchivedIsLeftOut() {
+        let sections = ThreadGrouping.sections([
+            Fixture.thread("a", state: "on-hold"),
+            Fixture.thread("b", state: "done"),
+            Fixture.thread("c", state: "done", archived: true),
+        ])
+        XCTAssertEqual(sections.map(\.title), ["Replied", "On hold"])
+        XCTAssertEqual(sections[0].threads.map(\.id), ["b"])
+    }
+
+    func testNewRepliesStayAboveRecentGroupsAndCompletedRunsAreNotArchived() {
+        let fresh: OmniThread = Fixture.decode(["id": "fresh", "state": "done", "unread": 1, "lastActivityAt": "2026-10-10T16:00:00.000Z"])
+        let recent: OmniThread = Fixture.decode(["id": "recent", "state": "done", "lastActivityAt": "2026-10-10T15:00:00.000Z"])
+        let old: OmniThread = Fixture.decode(["id": "old", "state": "working", "lastActivityAt": "2026-10-09T15:00:00.000Z"])
+        let sections = ThreadGrouping.sections([old, recent, fresh])
+        XCTAssertEqual(sections.map(\.title), ["New replies", "Replied", "Working"])
+        XCTAssertEqual(sections[0].threads.map(\.id), ["fresh"])
+        XCTAssertFalse(fresh.archived)
+    }
+    func testHistoryUsesActivityDatesAndPinnedRowsStayFirst() {
+        func row(_ id: String, _ day: String, pinned: Bool = false) -> OmniThread {
+            Fixture.decode(["id": id, "state": "done", "pinned": pinned, "lastActivityAt": "2026-10-\(day)T15:00:00.000Z"])
+        }
+        let section = ThreadGrouping.sections([row("old", "08"), row("fresh", "10"), row("pinned", "07", pinned: true)])[0]
+        XCTAssertEqual(section.threads.map(\.id), ["pinned", "fresh", "old"])
+    }
+    func testStaleReadAcknowledgementCannotClearANewerReply() async {
+        let service = FakeService()
+        service.lists(.success(Fixture.list([Fixture.threadJSON("fresh", unread: 1, lastSeq: 9)])))
+        let model = make(service)
+        await model.refresh()
+        model.markRead("fresh", through: 8)
+        XCTAssertEqual(model.thread("fresh")?.unread, 1)
+        model.markRead("fresh", through: 9)
+        XCTAssertEqual(model.thread("fresh")?.unread, 0)
+    }
+
+    func testTitlesFallBackToThePreview() {
+        let untitled: OmniThread = Fixture.decode(["id": "x", "state": "done", "preview": "  find 45 minutes with Dana  "])
+        XCTAssertEqual(ThreadGrouping.displayTitle(untitled), "find 45 minutes with Dana")
+        XCTAssertNil(ThreadGrouping.subtitle(untitled))
+        let waiting: OmniThread = Fixture.decode(Fixture.threadJSON("y", state: "waiting", waitingOn: "Dana"))
+        XCTAssertEqual(ThreadGrouping.subtitle(waiting), "on Dana")
+        XCTAssertEqual(ThreadGrouping.displayTitle(Fixture.decode(["id": "z"])), "Untitled thread")
+    }
+
+    private func make(_ service: FakeService, _ signedOut: Counter = Counter()) -> ThreadListModel {
+        ThreadListModel(service: service, sink: ErrorSink { signedOut.bump() })
+    }
+
+    func testRefreshLoadsGroupsAndCountsUnread() async {
+        let service = FakeService()
+        service.lists(.success(Fixture.list([Fixture.threadJSON("a", state: "needs-you", unread: 2), Fixture.threadJSON("b", state: "done")])))
+        let model = make(service)
+        await model.refresh()
+        XCTAssertEqual(model.phase, .loaded)
+        XCTAssertEqual(model.sections.map(\.title), ["New replies", "Replied"])
+        XCTAssertEqual(model.unreadCount, 1)
+        XCTAssertFalse(model.agentUnavailable)
+        XCTAssertFalse(model.isEmpty)
+    }
+
+    func testAGoneThreadSaysSoInItsRowAndCanBeRemoved() async {
+        let service = FakeService()
+        service.lists(.success(Fixture.list([Fixture.threadJSON("old", state: "done", gone: true), Fixture.threadJSON("live", state: "done")])))
+        service.patches(.success(Fixture.thread("old", archived: true)))
+        let model = make(service)
+        await model.refresh()
+        XCTAssertEqual(model.thread("old")?.gone, true)
+        XCTAssertEqual(ThreadGrouping.subtitle(model.thread("old")!), "No longer available")
+        XCTAssertNil(ThreadGrouping.subtitle(model.thread("live")!))
+        let removed = await model.remove("old")
+        XCTAssertTrue(removed)
+        XCTAssertEqual(service.patchCalls, ["old archived=true"])
+        XCTAssertEqual(model.threads.map(\.id), ["live"])
+        XCTAssertNil(model.removeError)
+    }
+
+    func testRemovingAThreadTheServerHasNoRowForStillClearsItAndAFailureKeepsIt() async {
+        let service = FakeService()
+        service.lists(.success(Fixture.list([Fixture.threadJSON("a"), Fixture.threadJSON("b")])))
+        service.patches(.failure(PrismError.rejected(Fixture.failure(404, "not_found"))), .failure(PrismError.unreachable("connection refused")))
+        let model = make(service)
+        await model.refresh()
+        let first = await model.remove("a")
+        XCTAssertTrue(first, "nothing is left on the server to remove")
+        XCTAssertEqual(model.threads.map(\.id), ["b"])
+        let second = await model.remove("b")
+        XCTAssertFalse(second)
+        XCTAssertEqual(model.threads.map(\.id), ["b"], "a thread that could not be removed stays")
+        XCTAssertEqual(model.removeError, "Couldn't remove it. Can't reach the server. Check that it's running and that this device is on the right network.")
+        model.clearRemoveError()
+        XCTAssertNil(model.removeError)
+    }
+
+    func testEmptyListAndAgentUnavailable() async {
+        let service = FakeService()
+        service.lists(.success(Fixture.list([], hermes: "unavailable")))
+        let model = make(service)
+        await model.refresh()
+        XCTAssertTrue(model.isEmpty)
+        XCTAssertTrue(model.agentUnavailable)
+    }
+
+    func testSearchIsSentTrimmedAndNotSentWhenBlank() async {
+        let service = FakeService()
+        service.lists(.success(Fixture.list([])))
+        let model = make(service)
+        model.searchText = "  dana "
+        await model.refresh()
+        model.searchText = "   "
+        await model.refresh()
+        XCTAssertEqual(service.searches, ["dana", nil])
+    }
+
+    func testFailureIsPlainLanguageAndSignedOutGoesToTheApp() async {
+        let service = FakeService()
+        let signedOut = Counter()
+        service.lists(.failure(PrismError.unreachable("offline")), .failure(PrismError.signedOut))
+        let model = make(service, signedOut)
+        await model.refresh()
+        XCTAssertEqual(model.phase.failure, "Can't reach the server. Check that it's running and that this device is on the right network.")
+        XCTAssertEqual(signedOut.count, 0)
+        await model.refresh()
+        XCTAssertEqual(signedOut.count, 1)
+    }
+
+    func testCreatePutsTheThreadFirst() async {
+        let service = FakeService()
+        service.lists(.success(Fixture.list([Fixture.threadJSON("old")])))
+        service.created(.success(Fixture.decode(["thread": Fixture.threadJSON("new", state: "working"), "turnId": "turn1"])))
+        let model = make(service)
+        await model.refresh()
+        let created = await model.create(prompt: "  call Dana  ")
+        XCTAssertEqual(created?.turnId, "turn1")
+        XCTAssertEqual(service.createdPrompts, ["call Dana"])
+        XCTAssertEqual(model.threads.map(\.id), ["new", "old"])
+    }
+
+    func testCreateWithAnUnclearOutcomeReadsTheListInsteadOfTryingAgain() async {
+        let service = FakeService()
+        service.lists(.success(Fixture.list([])))
+        service.created(.failure(Fixture.unknownOutcome))
+        let model = make(service)
+        let created = await model.create(prompt: "call Dana")
+        XCTAssertNil(created)
+        XCTAssertEqual(service.createdPrompts.count, 1, "creating a thread is not idempotent: never retried automatically")
+        XCTAssertEqual(service.listReads, 1)
+        XCTAssertEqual(model.createError, "It isn't clear whether the thread was created. Check the list before sending it again.")
+    }
+}
+
+@MainActor
+final class ThreadTimelineTests: XCTestCase {
+    func testApprovalsAndCardsArePlacedByTime() {
+        let detail = Fixture.detail(
+            messages: [
+                Fixture.message("user", "find time with Dana", at: "2026-10-08T15:00:00.000Z", id: 1),
+                Fixture.message("tool", "prism_search_notes", at: "2026-10-08T15:00:01.000Z", id: 2),
+                Fixture.message("assistant", "Draft below.", at: "2026-10-08T15:00:05.000Z", id: 3),
+                Fixture.message("user", "thanks", at: "2026-10-08T16:00:00.000Z", id: 4),
+            ],
+            approvals: [Fixture.approvalJSON("apr1", createdAt: "2026-10-08T15:00:06.000Z")],
+            cards: [Fixture.card("n2"), Fixture.card("n1", updatedAt: "2026-10-08T15:00:02.000Z")]
+        )
+        let ids = ThreadTimeline.history(detail).map(\.id)
+        XCTAssertEqual(ids, ["m:0-1", "t:h1-2", "c:n1|updated|2026-10-08T15:00:02.000Z", "m:2-3", "a:apr1", "m:3-4", "c:n2|updated|"])
+    }
+
+    func testLiveItemsAndToolLabels() {
+        var transcript = TurnTranscript()
+        transcript.apply(OmniStreamEnvelope(seq: 1, turnId: "t", event: .toolUse(id: "u1", name: "prism_update_note", input: .null)))
+        transcript.apply(OmniStreamEnvelope(seq: nil, turnId: "t", event: .textDelta(blockId: "b1", text: "Hel")))
+        let live = ThreadTimeline.live(transcript, turnRunning: true)
+        XCTAssertEqual(live, [
+            .tool(id: "u1", name: "prism_update_note", ok: nil, summary: nil, running: true),
+            .streamingText(id: "b1", text: "Hel", isFinal: false),
+        ])
+        XCTAssertEqual(ThreadTimeline.toolLabel("prism_update_note"), "Update note")
+        XCTAssertEqual(ThreadTimeline.toolLabel("omni_propose"), "Propose")
+        XCTAssertEqual(ThreadTimeline.toolLabel("create-note"), "Create note")
+    }
+}
+
+@MainActor
+final class ThreadModelTests: XCTestCase {
+    private var service = FakeService()
+    private var signedOut = Counter()
+    private var approvals: ApprovalCenter!
+
+    private func make(_ id: String = "t1") -> ThreadModel {
+        let counter = signedOut
+        let sink = ErrorSink { counter.bump() }
+        approvals = ApprovalCenter(service: service, sink: sink)
+        return ThreadModel(threadID: id, service: service, approvals: approvals, sink: sink, sleep: noSleep)
+    }
+
+    func testOnlyVisibleSnapshotsAcknowledgeUnreadAndLateClosedReadsDoNot() async {
+        func detail() -> ThreadDetail {
+            Fixture.decode(["thread": Fixture.threadJSON("t1", unread: 1, lastSeq: 7), "messages": [], "cards": [], "approvals": []])
+        }
+        service.details(.success(detail()), .success(detail()), .success(detail()))
+        let model = make()
+        await model.checkAgain() // background read: never presented
+        XCTAssertTrue(service.readCalls.isEmpty)
+        await model.open()
+        XCTAssertTrue(service.readCalls.isEmpty, "Inactive scenes cannot acknowledge a visible reply")
+        model.setSceneActive(true)
+        while service.readCalls.isEmpty { await Task.yield() }
+        XCTAssertEqual(service.readCalls, ["t1:7"])
+        model.close()
+        service.holdNextDetail()
+        let pending = Task { await model.open() }
+        while !service.detailIsWaiting { await Task.yield() }
+        model.close()
+        service.releaseDetail()
+        await pending.value
+        XCTAssertEqual(service.readCalls, ["t1:7"], "A request finishing after the screen closes cannot mark its reply read")
+    }
+
+    func testBackgroundReloadOfAnOpenConversationKeepsReplyUnread() async {
+        let unread: ThreadDetail = Fixture.decode(["thread": Fixture.threadJSON("t1", unread: 1, lastSeq: 7), "messages": [], "cards": [], "approvals": []])
+        service.details(.success(unread), .success(unread))
+        let model = make()
+        await model.open()
+        await model.changedOnServer()
+        XCTAssertTrue(model.isOpen)
+        XCTAssertTrue(service.readCalls.isEmpty)
+        model.close()
+        model.setSceneActive(true)
+        await Task.yield()
+        XCTAssertTrue(service.readCalls.isEmpty, "Foregrounding a closed conversation is not a read")
+    }
+
+    private let hello = Fixture.message("user", "hello", at: "2026-10-08T15:00:00.000Z", id: 1)
+    private let answer = Fixture.message("assistant", "Hi Alex.", at: "2026-10-08T15:00:03.000Z", id: 2)
+
+    private func texts(_ model: ThreadModel) -> [String] {
+        model.timeline.map { item in
+            switch item {
+            case .message(_, let role, let text, _): return "\(role.rawValue):\(text)"
+            case .streamingText(_, let text, let isFinal): return "\(isFinal ? "final" : "live"):\(text)"
+            case .pendingMessage(let text, let failed): return "\(failed ? "failed" : "pending"):\(text)"
+            case .tool(_, let name, let ok, _, let running): return "tool:\(name):\(ok.map(String.init) ?? "nil"):\(running)"
+            case .card(_, let card): return "card:\(card.noteId)"
+            case .approval(let id): return "approval:\(id)"
+            case .itemCard(let id): return "item_card:\(id)"
+            case .turnEnded(let text): return "ended:\(text)"
+            }
+        }
+    }
+
+    // MARK: Item cards inline
+
+    private func draftCard(_ id: String = "c1", state: CardState = .draftReady) -> OmniCard {
+        OmniCard(id: id, sourceKey: "src-\(id)", kind: .email, state: state, headline: "Sam asks about it",
+                 options: [.init(id: "a", label: "Say yes", plan: "Reply yes", produces: ["email-reply"], draft: nil),
+                           .init(id: "b", label: "Later", plan: "Reply later", produces: ["email-reply"], draft: nil)],
+                 recommended: "a", itemRefs: ["src-\(id)"], threadId: "t1", approvalIds: ["apr1"], chosenOptionId: "a",
+                 createdAt: Date(timeIntervalSince1970: 1_792_080_030), updatedAt: Date(timeIntervalSince1970: 1_792_080_030), section: .approve)
+    }
+
+    private func withCards(_ base: ThreadDetail, _ cards: [OmniCard]) -> ThreadDetail {
+        ThreadDetail(thread: base.thread, messages: base.messages, cards: base.cards, approvals: base.approvals, activeTurnId: base.activeTurnId, itemCards: cards)
+    }
+
+    func testADraftReadyCardCarriesItsApprovalSoTheDraftShowsOnce() async {
+        let base = Fixture.detail(lastSeq: 4, messages: [hello, answer], approvals: [Fixture.approvalJSON("apr1")])
+        service.details(.success(withCards(base, [draftCard()])))
+        let model = make()
+        await model.open()
+        let rows = texts(model)
+        XCTAssertTrue(rows.contains("item_card:c1"))
+        XCTAssertFalse(rows.contains("approval:apr1"), "the card shows the draft; no second copy")
+        // Once the card is closed, the approval returns as its historical row.
+        service.details(.success(withCards(base, [draftCard(state: .sent)])))
+        await model.reload()
+        XCTAssertTrue(texts(model).contains("approval:apr1"))
+    }
+
+    func testAStreamApprovalOfAnInlineDraftReadyCardIsNotShownTwice() async {
+        service.details(.success(Fixture.detail(lastSeq: 14, messages: [hello, answer], activeTurnId: "turn1")))
+        let stream = service.manualStream()
+        let model = make()
+        await model.open()
+        stream.yield(Fixture.event(15, turn: "turn1", .itemCard(draftCard())))
+        stream.yield(Fixture.event(16, turn: "turn1", .approval(Fixture.approval("apr1"))))
+        await eventually("card on the stream") { self.texts(model).contains("item_card:c1") }
+        XCTAssertFalse(texts(model).contains("approval:apr1"))
+        // An approval no card owns always shows.
+        stream.yield(Fixture.event(17, turn: "turn1", .approval(Fixture.approval("apr2"))))
+        await eventually("lone approval") { self.texts(model).contains("approval:apr2") }
+    }
+
+    func testAStreamOnlyCardIsAppendedThenDedupedOnceTheDetailHoldsIt() async {
+        service.details(
+            .success(Fixture.detail(lastSeq: 14, messages: [hello, answer], activeTurnId: "turn1")),
+            .success(withCards(Fixture.detail(lastSeq: 16, messages: [hello, answer]), [draftCard()]))
+        )
+        let stream = service.manualStream()
+        let model = make()
+        await model.open()
+        stream.yield(Fixture.event(15, turn: "turn1", .itemCard(draftCard())))
+        await eventually("appended") { self.texts(model).last == "item_card:c1" }
+        stream.yield(Fixture.event(16, turn: "turn1", .result(ok: true, durationMs: 1, errorCode: nil)))
+        stream.finish()
+        await eventually("detail reloaded") { !model.isRunning }
+        await model.reload()
+        XCTAssertEqual(texts(model).filter { $0 == "item_card:c1" }.count, 1)
+    }
+
+    func testOpeningAnIdleThreadShowsHistoryAndOpensNoStream() async {
+        service.details(.success(Fixture.detail(lastSeq: 9, messages: [hello, answer])))
+        let model = make()
+        await model.open()
+        XCTAssertEqual(model.phase, .loaded)
+        XCTAssertEqual(texts(model), ["user:hello", "assistant:Hi Alex."])
+        XCTAssertFalse(model.isRunning)
+        XCTAssertTrue(service.streamAfters.isEmpty)
+    }
+
+    func testALoadFailureIsShownAndSignedOutGoesToTheApp() async {
+        service.details(.failure(PrismError.outcomeUnknown(OutcomeUnknown(status: 502, code: "hermes_unavailable", reason: "HTTP 502"))), .failure(PrismError.signedOut))
+        let model = make()
+        await model.open()
+        XCTAssertEqual(model.phase.failure, "The server is up, but it can't reach the agent right now.")
+        XCTAssertFalse(model.isUnavailable, "a failure that may pass is not 'no longer available'")
+        await model.reload()
+        XCTAssertEqual(signedOut.count, 1)
+    }
+
+    // MARK: a thread the agent no longer has (first-run fix: the 404s in the dev log)
+
+    func testAThreadTheServerCannotFindIsUnavailableAndIsNotAskedForAgain() async {
+        service.details(.failure(PrismError.rejected(Fixture.failure(404, "not_found"))))
+        var told: [String] = []
+        let counter = signedOut
+        let sink = ErrorSink { counter.bump() }
+        approvals = ApprovalCenter(service: service, sink: sink)
+        let model = ThreadModel(threadID: "t1", service: service, approvals: approvals, sink: sink, sleep: noSleep, onUnavailable: { told.append($0) })
+        await model.open()
+        XCTAssertTrue(model.isUnavailable)
+        XCTAssertEqual(model.phase.failure, PlainLanguage.threadUnavailable)
+        XCTAssertEqual(told, ["t1"], "the list is told, so the row says so too")
+        XCTAssertEqual(service.detailReads, 1)
+        // Coming back to it, a notice, a reconnect, pull-to-refresh: none of them asks again.
+        await model.open()
+        await model.changedOnServer()
+        await model.reload()
+        model.close()
+        await model.open()
+        XCTAssertEqual(service.detailReads, 1, "one GET, not three")
+        // Nothing can be sent into it.
+        model.draft = "are you there?"
+        XCTAssertFalse(model.canSend)
+        await model.send()
+        XCTAssertTrue(service.startTexts.isEmpty)
+        XCTAssertEqual(model.draft, "are you there?", "the text is not thrown away")
+        XCTAssertTrue(service.streamAfters.isEmpty)
+    }
+
+    func testCheckAgainAsksOnceAndAThreadThatCameBackOpensNormally() async {
+        service.details(.failure(PrismError.rejected(Fixture.failure(404, "not_found"))), .failure(PrismError.rejected(Fixture.failure(404, "not_found"))), .success(Fixture.detail(messages: [hello, answer])))
+        let model = make()
+        await model.open()
+        await model.checkAgain()
+        XCTAssertTrue(model.isUnavailable)
+        XCTAssertEqual(service.detailReads, 2)
+        await model.checkAgain()
+        XCTAssertFalse(model.isUnavailable)
+        XCTAssertEqual(model.phase, .loaded)
+        XCTAssertEqual(texts(model), ["user:hello", "assistant:Hi Alex."])
+        model.draft = "hello again"
+        XCTAssertTrue(model.canSend)
+    }
+
+    func testAThreadTheListAlreadyKnowsIsGoneIsNeverRequested() async {
+        let model = make()
+        await model.open(knownGone: true)
+        XCTAssertTrue(model.isUnavailable)
+        XCTAssertEqual(model.phase.failure, PlainLanguage.threadUnavailable)
+        XCTAssertEqual(service.detailReads, 0)
+    }
+
+    func testAThreadThatDisappearsWhileItIsOpenBecomesUnavailable() async {
+        service.details(.success(Fixture.detail(messages: [hello, answer])), .failure(PrismError.rejected(Fixture.failure(404, "not_found"))))
+        let model = make()
+        await model.open()
+        XCTAssertEqual(model.phase, .loaded)
+        await model.changedOnServer()
+        XCTAssertTrue(model.isUnavailable)
+        XCTAssertFalse(model.canSend)
+    }
+
+    func testOpeningWhileTheFirstReadIsInFlightDoesNotReadTwice() async {
+        service.details(.success(Fixture.detail(messages: [hello])))
+        let model = make()
+        async let first: Void = model.open()
+        async let second: Void = model.changedOnServer()
+        async let third: Void = model.open()
+        _ = await (first, second, third)
+        XCTAssertEqual(service.detailReads, 1)
+        XCTAssertEqual(model.phase, .loaded)
+    }
+
+    func testAcceptedInitialVoicePromptSurvivesMissingHistoryAndReconcilesOnce() async {
+        service.details(
+            .success(Fixture.detail(messages: [answer])),
+            .success(Fixture.detail(messages: [hello, answer]))
+        )
+        let model = make()
+        model.rememberCreatedVoicePrompt("hello")
+        XCTAssertEqual(texts(model), ["user:hello"])
+        await model.open()
+        XCTAssertEqual(texts(model), ["user:hello", "assistant:Hi Alex."])
+        XCTAssertNil(model.pendingText, "An accepted creation is not an unsent retry")
+        await model.reload()
+        XCTAssertEqual(texts(model), ["user:hello", "assistant:Hi Alex."])
+    }
+
+    func testSendStreamsDeltasThenTheFinalTextReplacesThem() async {
+        service.details(
+            .success(Fixture.detail(lastSeq: 4, messages: [hello, answer])),
+            .success(Fixture.detail(lastSeq: 9, messages: [hello, answer, Fixture.message("user", "and again", at: "2026-10-08T15:01:00.000Z", id: 3), Fixture.message("assistant", "Hello again.", at: "2026-10-08T15:01:02.000Z", id: 4)]))
+        )
+        service.starts(.success(.started(turnId: "turn1")))
+        let stream = service.manualStream()
+        let model = make()
+        await model.open()
+        model.draft = "  and again "
+        XCTAssertTrue(model.canSend)
+        await model.send()
+        XCTAssertEqual(service.startTexts, ["and again"])
+        XCTAssertEqual(model.draft, "")
+        XCTAssertTrue(model.isRunning)
+        XCTAssertFalse(model.canSend)
+        XCTAssertEqual(texts(model).last, "pending:and again")
+
+        stream.yield(.connected)
+        stream.yield(Fixture.event(5, .status(state: .working, reason: nil)))
+        stream.yield(Fixture.event(6, .toolUse(id: "u1", name: "prism_search_notes", input: .null)))
+        stream.yield(Fixture.event(nil, .textDelta(blockId: "b1", text: "Hel")))
+        stream.yield(Fixture.event(nil, .textDelta(blockId: "b1", text: "lo")))
+        await eventually("deltas") { self.texts(model).contains("live:Hello") }
+        XCTAssertEqual(model.connection, .live)
+        XCTAssertEqual(texts(model), ["user:hello", "assistant:Hi Alex.", "pending:and again", "tool:prism_search_notes:nil:true", "live:Hello"])
+        // The stream started after the thread's last stored event.
+        XCTAssertEqual(service.streamAfters, [4])
+
+        stream.yield(Fixture.event(7, .toolResult(toolUseId: "u1", ok: true, summary: "3 notes")))
+        stream.yield(Fixture.event(8, .text(blockId: "b1", text: "Hello again.")))
+        // A replayed event (same seq) changes nothing.
+        stream.yield(Fixture.event(8, .text(blockId: "b1", text: "DUPLICATE")))
+        await eventually("final text") { self.texts(model).contains("final:Hello again.") }
+        XCTAssertTrue(texts(model).contains("tool:prism_search_notes:true:false"))
+        XCTAssertFalse(texts(model).contains { $0.contains("DUPLICATE") })
+
+        stream.yield(Fixture.event(9, .result(ok: true, durationMs: 900, errorCode: nil)))
+        stream.finish()
+        await eventually("turn end") { !model.isRunning }
+        // History now holds the turn; nothing is shown twice.
+        XCTAssertEqual(texts(model), ["user:hello", "assistant:Hi Alex.", "user:and again", "assistant:Hello again."])
+        XCTAssertNil(model.turnEnded)
+        XCTAssertEqual(model.connection, .idle)
+    }
+
+    func testACleanCloseWithoutAResultReadsTheThreadAndAttachesAgain() async {
+        service.details(
+            .success(Fixture.detail(lastSeq: 4, messages: [hello])),
+            // After the first stream ended: the turn is still running.
+            .success(Fixture.detail(lastSeq: 6, messages: [hello], activeTurnId: "turn1")),
+            // After the second stream (which carried the result).
+            .success(Fixture.detail(lastSeq: 8, messages: [hello, answer]))
+        )
+        service.starts(.success(.started(turnId: "turn1")))
+        service.streams(
+            [.success(.connected), .success(Fixture.event(5, .initialized(runId: "r"))), .success(Fixture.event(6, .text(blockId: "b1", text: "Working on it.")))],
+            [.success(.connected), .success(Fixture.event(7, .text(blockId: "b2", text: "Done."))), .success(Fixture.event(8, .result(ok: true, durationMs: 1, errorCode: nil)))]
+        )
+        let model = make()
+        await model.open()
+        model.draft = "go"
+        await model.send()
+        await eventually("turn end") { !model.isRunning && self.service.streamAfters.count == 2 }
+        // Attached again from the last event seen — not from the start, not from a guess.
+        XCTAssertEqual(service.streamAfters, [4, 6])
+        XCTAssertEqual(texts(model), ["user:hello", "assistant:Hi Alex."])
+    }
+
+    func testACleanCloseWithoutAResultAndNoActiveTurnEndsQuietly() async {
+        service.details(
+            .success(Fixture.detail(lastSeq: 4, messages: [hello])),
+            .success(Fixture.detail(lastSeq: 6, messages: [hello, answer]))
+        )
+        service.starts(.success(.started(turnId: "turn1")))
+        service.streams([.success(Fixture.event(5, .initialized(runId: "r"))), .success(Fixture.event(6, .text(blockId: "b1", text: "Hi Alex.")))])
+        let model = make()
+        await model.open()
+        model.draft = "go"
+        await model.send()
+        await eventually("turn end") { !model.isRunning }
+        XCTAssertEqual(service.streamAfters, [4])
+        XCTAssertEqual(texts(model), ["user:hello", "assistant:Hi Alex."])
+    }
+
+    func testAnEmptyReattachBacksOffAndKeepsTrying() async {
+        let running = Fixture.detail(lastSeq: 2, messages: [hello], activeTurnId: "turn1")
+        service.details(.success(running), .success(running), .success(running), .success(Fixture.detail(lastSeq: 3, messages: [hello, answer])))
+        service.streams([], [], [.success(Fixture.event(3, .result(ok: true, durationMs: 1, errorCode: nil)))])
+        let model = make()
+        await model.open()
+        await eventually("turn end") { !model.isRunning }
+        // Opened mid-turn: the turn's stored events are read from the start.
+        XCTAssertEqual(service.streamAfters, [0, 0, 0])
+    }
+
+    func testOpeningMidTurnShowsOnlyThatTurnsEvents() async {
+        service.details(
+            .success(Fixture.detail(lastSeq: 12, messages: [hello, answer, Fixture.message("user", "next", at: "2026-10-08T16:00:00.000Z", id: 3)], activeTurnId: "turn2")),
+            .success(Fixture.detail(lastSeq: 14, messages: [hello, answer]))
+        )
+        let stream = service.manualStream()
+        let model = make()
+        await model.open()
+        XCTAssertTrue(model.isRunning)
+        stream.yield(Fixture.event(3, turn: "turn1", .text(blockId: "old", text: "An old turn's text")))
+        stream.yield(Fixture.event(11, turn: "turn2", .toolUse(id: "u9", name: "prism_create_note", input: .null)))
+        stream.yield(Fixture.event(12, turn: "turn2", .text(blockId: "b", text: "Created it.")))
+        await eventually("replayed turn") { self.texts(model).contains("final:Created it.") }
+        XCTAssertEqual(service.streamAfters, [0])
+        XCTAssertFalse(texts(model).contains { $0.contains("old turn") })
+        XCTAssertTrue(texts(model).contains("tool:prism_create_note:nil:true"))
+        model.close()
+        XCTAssertFalse(model.isOpen)
+        XCTAssertEqual(model.connection, .idle)
+    }
+
+    func testAnUnclearSendKeepsTheMessageAndRetriesWithTheSameKey() async {
+        service.details(.success(Fixture.detail(lastSeq: 1, messages: [hello])), .success(Fixture.detail(lastSeq: 2, messages: [hello, answer])))
+        service.starts(.failure(Fixture.unknownOutcome), .failure(PrismError.unreachable("offline")), .success(.replayed(turnId: "turn1", status: "running")))
+        service.streams([.success(Fixture.event(2, .result(ok: true, durationMs: 1, errorCode: nil)))])
+        let model = make()
+        await model.open()
+        model.draft = "send the spec"
+        await model.send()
+        XCTAssertEqual(model.sendState, .failed(message: "It isn't clear whether your message arrived. Try again — it can't be sent twice."))
+        XCTAssertEqual(texts(model).last, "failed:send the spec")
+        XCTAssertFalse(model.canSend)
+
+        await model.retrySend()
+        XCTAssertEqual(model.sendState, .failed(message: "Can't reach the server. Check that it's running and that this device is on the right network."))
+        await model.retrySend()
+        await eventually("turn end") { !model.isRunning && model.pendingText == nil }
+
+        XCTAssertEqual(service.startKeys.count, 3)
+        XCTAssertEqual(Set(service.startKeys).count, 1, "every retry of one press resends that press's key")
+        XCTAssertEqual(service.startTexts, ["send the spec", "send the spec", "send the spec"])
+        XCTAssertEqual(model.sendState, .idle)
+    }
+
+    func testEachPressOfSendGetsItsOwnKey() async {
+        service.details(.success(Fixture.detail(lastSeq: 1, messages: [hello])))
+        service.starts(.success(.started(turnId: "turn1")), .success(.started(turnId: "turn2")))
+        service.streams(
+            [.success(Fixture.event(2, turn: "turn1", .result(ok: true, durationMs: 1, errorCode: nil)))],
+            [.success(Fixture.event(3, turn: "turn2", .result(ok: true, durationMs: 1, errorCode: nil)))]
+        )
+        let model = make()
+        await model.open()
+        model.draft = "one"
+        await model.send()
+        await eventually { !model.isRunning }
+        model.draft = "two"
+        await model.send()
+        await eventually { !model.isRunning }
+        XCTAssertEqual(service.startKeys.count, 2)
+        XCTAssertNotEqual(service.startKeys[0], service.startKeys[1])
+    }
+
+    func testDiscardGivesTheKeptMessageBack() async {
+        service.details(.success(Fixture.detail(messages: [hello])))
+        service.starts(.failure(Fixture.unknownOutcome))
+        let model = make()
+        await model.open()
+        model.draft = "send the spec"
+        await model.send()
+        model.discardPending()
+        XCTAssertEqual(model.draft, "send the spec")
+        XCTAssertNil(model.pendingText)
+        XCTAssertEqual(model.sendState, .idle)
+    }
+
+    func testATurnAlreadyRunningHandsTheTextBackAndAttaches() async {
+        service.details(.success(Fixture.detail(lastSeq: 3, messages: [hello])), .success(Fixture.detail(lastSeq: 4, messages: [hello, answer])))
+        service.starts(.success(.alreadyRunning(turnId: "turn0")))
+        let stream = service.manualStream()
+        let model = make()
+        await model.open()
+        model.draft = "too soon"
+        await model.send()
+        XCTAssertEqual(model.draft, "too soon")
+        XCTAssertNil(model.pendingText)
+        XCTAssertEqual(model.activeTurnID, "turn0")
+        stream.yield(Fixture.event(4, turn: "turn0", .result(ok: true, durationMs: 1, errorCode: nil)))
+        stream.finish()
+        await eventually { !model.isRunning }
+    }
+
+    func testADefiniteRefusalHandsTheTextBack() async {
+        service.details(.success(Fixture.detail(messages: [hello])))
+        service.starts(.failure(PrismError.rejected(Fixture.failure(400, "hermes_rejected"))))
+        let model = make()
+        await model.open()
+        model.draft = "nope"
+        await model.send()
+        XCTAssertEqual(model.draft, "nope")
+        XCTAssertEqual(model.sendState, .idle)
+        XCTAssertEqual(model.streamProblem, "The agent refused that message.")
+    }
+
+    func testStopCancelsTheRunningTurnAndSaysSo() async {
+        service.details(.success(Fixture.detail(lastSeq: 1, messages: [hello])), .success(Fixture.detail(state: "waiting", lastSeq: 3, messages: [hello])))
+        service.starts(.success(.started(turnId: "turn1")))
+        service.cancels(.success(Fixture.decode(["turnId": "turn1", "status": "cancelling"])))
+        let stream = service.manualStream()
+        let model = make()
+        await model.open()
+        model.draft = "stub:slow"
+        await model.send()
+        stream.yield(Fixture.event(nil, .textDelta(blockId: "b", text: "chunk")))
+        await eventually { self.texts(model).contains("live:chunk") }
+        await model.stop()
+        XCTAssertEqual(service.cancelled, ["turn1"])
+        stream.yield(Fixture.event(2, .result(ok: false, durationMs: 5, errorCode: "cancelled")))
+        stream.yield(Fixture.event(3, .status(state: .waiting, reason: "cancelled")))
+        stream.finish()
+        await eventually { !model.isRunning }
+        XCTAssertEqual(model.turnEnded, "Stopped.")
+        XCTAssertEqual(texts(model).last, "ended:Stopped.")
+        // Nothing to stop any more.
+        await model.stop()
+        XCTAssertEqual(service.cancelled.count, 1)
+    }
+
+    func testAFailedTurnIsExplainedInPlainLanguage() async {
+        service.details(.success(Fixture.detail(lastSeq: 1, messages: [hello])), .success(Fixture.detail(state: "needs-you", lastSeq: 2, messages: [hello])))
+        service.starts(.success(.started(turnId: "turn1")))
+        service.streams([.success(Fixture.event(2, .result(ok: false, durationMs: 5, errorCode: "usage_limit")))])
+        let model = make()
+        await model.open()
+        model.draft = "go"
+        await model.send()
+        await eventually { !model.isRunning }
+        XCTAssertEqual(model.turnEnded, "The model's usage limit was reached. Try again later.")
+        // The next send clears it.
+        service.starts(.success(.started(turnId: "turn2")))
+        _ = service.manualStream()
+        model.draft = "again"
+        await model.send()
+        XCTAssertNil(model.turnEnded)
+        model.close()
+    }
+
+    func testAReconnectIsShownAndAFatalStreamErrorStopsFollowing() async {
+        service.details(.success(Fixture.detail(lastSeq: 1, messages: [hello])))
+        service.starts(.success(.started(turnId: "turn1")))
+        let stream = service.manualStream()
+        let model = make()
+        await model.open()
+        model.draft = "go"
+        await model.send()
+        stream.yield(.connected)
+        stream.yield(.reconnecting(delay: .seconds(1)))
+        await eventually { model.connection == .reconnecting }
+        stream.finish(throwing: PrismError.forbidden(Fixture.failure(403, "forbidden")))
+        await eventually { model.streamProblem != nil }
+        XCTAssertEqual(model.streamProblem, "This account isn't allowed to use Omni on this server. Omni is for the server's owner.")
+        XCTAssertEqual(model.connection, .idle)
+    }
+
+    func testSignedOutOnTheStreamGoesToTheApp() async {
+        service.details(.success(Fixture.detail(lastSeq: 1, messages: [hello], activeTurnId: "turn1")))
+        service.streams([.failure(PrismError.signedOut)])
+        let model = make()
+        await model.open()
+        await eventually { self.signedOut.count == 1 }
+        XCTAssertNil(model.streamProblem)
+    }
+
+    func testAnAgentInitiatedMessageAppearsOnAnOpenThread() async {
+        service.details(
+            .success(Fixture.detail(lastSeq: 4, messages: [hello, answer])),
+            .success(Fixture.detail(lastSeq: 5, messages: [hello, answer, Fixture.message("assistant", "Dana replied: Tuesday works.", at: "2026-10-08T18:00:00.000Z", id: 9)]))
+        )
+        let model = make()
+        await model.open()
+        await model.changedOnServer()
+        XCTAssertEqual(texts(model).last, "assistant:Dana replied: Tuesday works.")
+        XCTAssertEqual(service.detailReads, 2)
+        // A closed thread is not re-read.
+        model.close()
+        await model.changedOnServer()
+        XCTAssertEqual(service.detailReads, 2)
+    }
+
+    func testAStatusChangeOfAStoredApprovalStaysInPlace() async {
+        // Owner report 2026-11-17: each approved / sent / done update arrives with no turn and
+        // the old approval jumped to the bottom of the chat, again and again.
+        let early = Fixture.approvalJSON("apr_old")
+        service.details(.success(Fixture.detail(lastSeq: 14, messages: [hello, answer], approvals: [early], activeTurnId: "turn1")))
+        let stream = service.manualStream()
+        let model = make()
+        await model.open()
+        let before = texts(model)
+        XCTAssertTrue(before.contains("approval:apr_old"))
+        stream.yield(Fixture.event(15, turn: nil, .approval(Fixture.approval("apr_old", status: "approved"))))
+        stream.yield(Fixture.event(16, turn: "turn1", .approval(Fixture.approval("apr_new"))))
+        await eventually("new approval appended") { self.texts(model).contains("approval:apr_new") }
+        let after = texts(model)
+        XCTAssertEqual(after.filter { $0 == "approval:apr_old" }.count, 1)
+        XCTAssertEqual(after.firstIndex(of: "approval:apr_old"), before.firstIndex(of: "approval:apr_old"), "not moved to the bottom")
+        XCTAssertEqual(after.last, "approval:apr_new")
+    }
+
+    func testAnApprovalOnTheStreamReachesTheApprovalCenterOnce() async {
+        let pendingJSON = Fixture.approvalJSON("apr1")
+        service.details(
+            .success(Fixture.detail(lastSeq: 1, messages: [hello])),
+            .success(Fixture.detail(state: "needs-you", lastSeq: 3, messages: [hello, answer], approvals: [pendingJSON]))
+        )
+        service.starts(.success(.started(turnId: "turn1")))
+        let stream = service.manualStream()
+        let model = make()
+        await model.open()
+        model.draft = "draft it"
+        await model.send()
+        stream.yield(Fixture.event(2, .approval(Fixture.approval("apr1"))))
+        await eventually { self.texts(model).contains("approval:apr1") }
+        XCTAssertEqual(approvals.card(for: "apr1")?.standing(), .pending)
+        stream.yield(Fixture.event(3, .result(ok: true, durationMs: 1, errorCode: nil)))
+        stream.finish()
+        await eventually { !model.isRunning }
+        XCTAssertEqual(texts(model).filter { $0 == "approval:apr1" }.count, 1)
+        XCTAssertEqual(approvals.pending.map(\.id), ["apr1"])
+    }
+}

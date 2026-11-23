@@ -1,0 +1,9 @@
+name: omni-resource-guard
+version: "1.0"
+description: >-
+  Keeps Hermes from starving the Mac it runs on. Caps live agent-browser
+  sessions (new sessions past the cap are refused with a message the model
+  sees), refuses fan-out shell patterns that start browsers in parallel, stops
+  new browsers under critical memory pressure, gives every agent-browser daemon
+  a short idle timeout, and reaps daemons past a hard cap or a maximum age.
+  Fails open: a bug here never blocks a tool call.

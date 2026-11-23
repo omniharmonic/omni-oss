@@ -1,0 +1,56 @@
+import Foundation
+@testable import OmniCore
+import XCTest
+
+final class ExternalNavigationTests: XCTestCase {
+    func testColdTapWaitsForAuthenticationUnlockAndMountedNavigationThenConsumesOnce() {
+        var queue = ExternalNavigationQueue()
+        XCTAssertTrue(queue.receive(URL(string: "omni://thread/exact_conversation-42")!))
+        XCTAssertNil(queue.take(signedIn: false, unlocked: true, navigationReady: false))
+        XCTAssertNil(queue.take(signedIn: true, unlocked: false, navigationReady: true))
+        XCTAssertNil(queue.take(signedIn: true, unlocked: true, navigationReady: false))
+        XCTAssertEqual(queue.take(signedIn: true, unlocked: true, navigationReady: true), .thread("exact_conversation-42"))
+        XCTAssertNil(queue.take(signedIn: true, unlocked: true, navigationReady: true))
+    }
+    func testInvalidLinkCannotReplacePendingConversationAndLatestValidTapWins() {
+        var queue = ExternalNavigationQueue()
+        XCTAssertTrue(queue.receive(URL(string: "omni://thread/first")!))
+        for text in ["https://thread/other", "omni://thread/a/b", "omni://thread/a?token=secret", "omni://thread/a%2Fb", "omni://user@thread/a", "omni://auth/callback"] {
+            XCTAssertFalse(queue.receive(URL(string: text)!))
+        }
+        XCTAssertEqual(queue.take(signedIn: true, unlocked: true, navigationReady: true), .thread("first"))
+        XCTAssertTrue(queue.receive(URL(string: "omni://thread/second")!))
+        XCTAssertTrue(queue.receive(URL(string: "omni://nudge/digest")!))
+        XCTAssertEqual(queue.take(signedIn: true, unlocked: true, navigationReady: true), .needsYou)
+    }
+    func testPrismSourcePreservesServerVaultAndBrowserFallback() {
+        let link = PrismSourceLink(web: "https://workspace.example/page/note_1", noteID: "note_1")!
+        let native = URLComponents(url: link.native!, resolvingAgainstBaseURL: false)!
+        XCTAssertEqual(native.host, "source")
+        XCTAssertEqual(native.path, "/note_1")
+        XCTAssertEqual(native.queryItems?.first(where: { $0.name == "server" })?.value, "https://workspace.example")
+        XCTAssertEqual(native.queryItems?.first(where: { $0.name == "vault" })?.value, "primary")
+        XCTAssertEqual(link.web.absoluteString, "https://workspace.example/page/note_1?vault=primary")
+        XCTAssertNil(PrismSourceLink(web: "file:///secret", noteID: "note_1"))
+        XCTAssertNil(PrismSourceLink(web: "https://user:password@example.test/page/id", noteID: "id"))
+        XCTAssertNil(PrismSourceLink(web: "https://example.test/page/id", noteID: "../auth")?.native)
+        XCTAssertNil(PrismSourceLink(web: "https://example.test/collab/id?t=capability", noteID: "id")?.native)
+        XCTAssertNil(PrismSourceLink(web: "https://example.test/page/other", noteID: "id")?.native)
+    }
+
+    func testACardTapOpensNeedsYouAndFocusesThatCardOnce() {
+        var queue = ExternalNavigationQueue()
+        XCTAssertTrue(queue.receive(URL(string: "omni://card/card_0123456789abcdef01234567")!))
+        XCTAssertEqual(queue.take(signedIn: true, unlocked: true, navigationReady: true), .needsYou)
+        XCTAssertEqual(queue.takeFocusedCard(), "card_0123456789abcdef01234567")
+        XCTAssertNil(queue.takeFocusedCard())
+        XCTAssertTrue(queue.receive(URL(string: "omni://card/card_a")!))
+        XCTAssertTrue(queue.receive(URL(string: "omni://thread/t1")!))
+        XCTAssertEqual(queue.take(signedIn: true, unlocked: true, navigationReady: true), .thread("t1"))
+        XCTAssertNil(queue.takeFocusedCard(), "a later thread tap replaces the card focus")
+        XCTAssertFalse(queue.receive(URL(string: "omni://card/a%2Fb")!))
+        XCTAssertFalse(queue.receive(URL(string: "omni://card/")!))
+        XCTAssertFalse(queue.receive(URL(string: "omni://card/a%20b")!))
+        XCTAssertFalse(queue.receive(URL(string: "omni://card/a/b")!))
+    }
+}
